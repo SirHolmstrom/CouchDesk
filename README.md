@@ -91,6 +91,12 @@ On a phone:
 
 Every floating panel drags wherever you like, and they scramble back on-screen if you rotate the phone instead of vanishing off the edge.
 
+## Screenshots
+
+<img width="2445" height="1053" alt="Settings" src="https://github.com/user-attachments/assets/7aa876c3-9d09-4f3f-a61e-c985ed2bed12" />
+<img width="2445" height="1053" alt="Keyboard" src="https://github.com/user-attachments/assets/87b1d87b-5387-4756-affd-407456db5e08" />
+
+
 ## Where it keeps its stuff
 
 The config is a JSON file in the app's data folder: port, bind address, session timeout, and the remote-access on/off flag. The same folder holds the certificate, the password hash, and the audit log:
