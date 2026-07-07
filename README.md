@@ -4,7 +4,7 @@ Your Windows PC in a browser tab.
 
 CouchDesk : run it on the PC, open a browser, and connect. There is no client to install on the other device, not account creation and nothing is relayed through somebody else's servers.
 
-<img width="2560" height="1280" alt="RemoteDesktopLAN" src="https://github.com/user-attachments/assets/ca4ae7c9-1da7-4e1b-86bb-a74d38af507e" />
+<img width="2560" height="1280" alt="image" src="https://github.com/user-attachments/assets/c2ea8eb0-9a0c-44ca-945b-bd7240354bf0" />
 
 ## What it does
 
