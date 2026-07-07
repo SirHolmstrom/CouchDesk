@@ -2,15 +2,13 @@
 
 Your Windows PC in a browser tab.
 
-I built this because I kept needing to check something on my PC from the couch, or from my phone after realizing I had left something running. Every solution seemed to want an account, a subscription, or a mountain of software.
-
-RemoteDesktopLAN is the small version: run it on the PC, open a browser, and connect. There is no client to install on the other device and nothing is relayed through somebody else's servers.
+RemoteDesktopLAN : run it on the PC, open a browser, and connect. There is no client to install on the other device, not account creation and nothing is relayed through somebody else's servers.
 
 <img width="2560" height="1280" alt="RemoteDesktopLAN" src="https://github.com/user-attachments/assets/ca4ae7c9-1da7-4e1b-86bb-a74d38af507e" />
 
 ## What it does
 
-- Streams your desktop to any modern browser over HTTPS.
+- Streams your desktop to any modern browser over HTTPS (locally default).
 - Works properly on a phone: trackpad-style mouse, keyboard, scrolling, zoom, and draggable controls.
 - Supports multiple monitors, live quality/FPS controls, and file uploads to the PC.
 - Runs quietly from the Windows tray instead of keeping a window open.
@@ -90,11 +88,6 @@ That also means your router and ISP get a vote. CGNAT may make incoming connecti
 | Sys keys | Ctrl, Alt, Shift, Win, Del, PrtSc, Esc, and Tab |
 | Send file | Saves a file into the PC's Downloads folder |
 
-<img width="611" height="263" alt="Regular view" src="https://github.com/user-attachments/assets/9ad1c7f2-09e6-48ae-96e5-123e09bd840a" />
-<img width="611" height="263" alt="Settings" src="https://github.com/user-attachments/assets/7aa876c3-9d09-4f3f-a61e-c985ed2bed12" />
-<img width="611" height="263" alt="Keyboard" src="https://github.com/user-attachments/assets/87b1d87b-5387-4756-123e09bd840a" />
-<img width="611" height="263" alt="Send to PC" src="https://github.com/user-attachments/assets/a69335ad-016a-4691-a45b-049934c748ba" />
-
 ## A few honest limitations
 
 - GDI capture is simple and dependable, but high resolutions and FPS can use a fair bit of CPU.
@@ -116,6 +109,8 @@ Uploaded files land here:
 
 ## License
 
-PolyForm Noncommercial 1.0.0. Use it, change it, and share it. Just don't sell it or build a business on it.
+[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0). Use it, change it, share it, all good. Just don't sell it or build a business on it.
 
-[Read the full license](https://polyformproject.org/licenses/noncommercial/1.0.0)
+| Use | Change | Distribute | Noncommercial |
+|---|---|---|---|
+| Yes | Yes | Yes | Yes |
