@@ -225,18 +225,31 @@ public sealed class StreamSession : IDisposable
     // latency drops toward capture + network + decode. The browser decodes with WebCodecs.
     private async Task WebCodecsSendLoopAsync(CancellationToken ct)
     {
-        await SendStatusAsync("video-h264");
-
         DesktopDuplicationSource? source = null;
         H264LowLatencyEncoder? encoder = null;
+        int fps = Math.Clamp(m_Fps, 1, 60);
+        try
+        {
+            int bitrate = Math.Clamp(m_Config.VideoBitrateKbps, 500, 100_000) * 1000;
+            source = new DesktopDuplicationSource(m_Monitor);
+            encoder = new H264LowLatencyEncoder(source.Width, source.Height, fps, bitrate);
+        }
+        catch (Exception ex)
+        {
+            // No hardware H.264 encoder / capture unavailable — fall back to the JPEG tile
+            // path so the session still works with hardware video defaulted on.
+            AuditLogger.Log("VIDEO_FALLBACK", ClientIp, ex.Message);
+            source?.Dispose();
+            await SendLoopAsync(ct);
+            return;
+        }
+
+        await SendStatusAsync("video-h264");
+
         Task? captureTask = null;
         var queue = new BlockingCollection<EncodedVideoFrame>(120);
         try
         {
-            int fps = Math.Clamp(m_Fps, 1, 60);
-            int bitrate = Math.Clamp(m_Config.VideoBitrateKbps, 500, 100_000) * 1000;
-            source = new DesktopDuplicationSource(m_Monitor);
-            encoder = new H264LowLatencyEncoder(source.Width, source.Height, fps, bitrate);
             encoder.FrameEncoded += f =>
             {
                 if (!queue.IsAddingCompleted && !queue.TryAdd(f))

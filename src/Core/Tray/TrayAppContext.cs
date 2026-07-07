@@ -42,6 +42,7 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
     private readonly WinForms.ToolStripMenuItem m_StartWithWindows = new("Start with Windows");
     private readonly WinForms.ToolStripMenuItem m_StartMinimized = new("Start Minimized");
     private readonly WinForms.ToolStripMenuItem m_ShowTaskbarButton = new("Show Taskbar Button");
+    private readonly WinForms.ToolStripMenuItem m_HardwareVideo = new("Hardware video (H.264, low latency)");
     private readonly Dictionary<int, WinForms.ToolStripMenuItem> m_FpsItems = new();
     private readonly Dictionary<int, WinForms.ToolStripMenuItem> m_QualityItems = new();
     private TaskbarStatusForm? m_TaskbarStatusForm;
@@ -171,8 +172,19 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
             m_QualityItems[preset.Item2] = item;
             quality.DropDownItems.Add(item);
         }
+        m_HardwareVideo.Click += (_, _) =>
+        {
+            // On = GPU capture + hardware H.264 (WebCodecs low latency); off = JPEG tiles.
+            m_Config.UseHardwareVideo = !m_Config.UseHardwareVideo;
+            m_Config.Save();
+            UpdateMenu();
+            // The codec path is chosen when a viewer connects, so drop active viewers to
+            // make them reconnect on the new path.
+            m_Host.Sessions.DisconnectAll();
+        };
         streaming.DropDownItems.Add(fps);
         streaming.DropDownItems.Add(quality);
+        streaming.DropDownItems.Add(m_HardwareVideo);
 
         var security = new WinForms.ToolStripMenuItem("Security");
         var changePassword = new WinForms.ToolStripMenuItem("Change Password");
@@ -506,6 +518,7 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
         m_StartWithWindows.Checked = m_Config.StartWithWindows;
         m_StartMinimized.Checked = m_Config.StartMinimized;
         m_ShowTaskbarButton.Checked = m_Config.ShowTaskbarButton;
+        m_HardwareVideo.Checked = m_Config.UseHardwareVideo;
 
         string? router = m_Config.LastRouterUrl ?? m_Network.GetRouterUrl();
         m_OpenRouter.Enabled = router is not null;

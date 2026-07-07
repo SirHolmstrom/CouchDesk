@@ -37,11 +37,12 @@ public sealed class AppConfig
     public int JpegQuality { get; set; } = 75;
 
     /// <summary>
-    /// When true, streaming uses GPU capture (DXGI Desktop Duplication) + hardware H.264
-    /// (Media Foundation, fragmented MP4) instead of the JPEG-tile path. Default off so the
-    /// dependable tile path stays the baseline; opt in from the tray. See PROTOTYPE.md.
+    /// When true (default), streaming uses GPU capture (DXGI Desktop Duplication) + hardware
+    /// H.264 instead of the JPEG-tile path; with VideoLowLatency it's the per-frame WebCodecs
+    /// path (single-digit-ms). Toggle it off from the tray to force JPEG tiles. If no hardware
+    /// encoder is available the server falls back to JPEG automatically. See PROTOTYPE.md.
     /// </summary>
-    public bool UseHardwareVideo { get; set; } = false;
+    public bool UseHardwareVideo { get; set; } = true;
 
     /// <summary>Target H.264 bitrate (kbps) for the hardware-video path.</summary>
     public int VideoBitrateKbps { get; set; } = 8000;
