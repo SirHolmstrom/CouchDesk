@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Capture.Gpu</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Vortice.Windows is the modern, maintained SharpDX successor (D3D11 + DXGI + Media
+         Foundation projections). Pinned to 3.5.0 because it still ships a net8.0 target;
+         the current 3.8.x line is net9.0/net10.0-only.
+
+         If `dotnet restore` complains that the package doesn't support net8.0-windows:
+           (a) bump these three to the newest 3.x that still lists net8.0 on nuget.org, OR
+           (b) retarget THIS project to net9.0-windows / net10.0-windows and use 3.8.3.
+         Either is safe — Core does not reference this project, so nothing else changes. -->
+    <PackageReference Include="Vortice.Direct3D11" Version="3.5.0" />
+    <PackageReference Include="Vortice.DXGI" Version="3.5.0" />
+    <PackageReference Include="Vortice.MediaFoundation" Version="3.5.0" />
+  </ItemGroup>
+
+</Project>

@@ -35,6 +35,23 @@ public sealed class AppConfig
     public int ExternalPort { get; set; } = 38443;
     public int FpsLimit { get; set; } = 30;
     public int JpegQuality { get; set; } = 75;
+
+    /// <summary>
+    /// When true, streaming uses GPU capture (DXGI Desktop Duplication) + hardware H.264
+    /// (Media Foundation, fragmented MP4) instead of the JPEG-tile path. Default off so the
+    /// dependable tile path stays the baseline; opt in from the tray. See PROTOTYPE.md.
+    /// </summary>
+    public bool UseHardwareVideo { get; set; } = false;
+
+    /// <summary>Target H.264 bitrate (kbps) for the hardware-video path.</summary>
+    public int VideoBitrateKbps { get; set; } = 8000;
+
+    /// <summary>
+    /// When true (default), the hardware-video path emits one H.264 frame at a time and the
+    /// browser decodes with WebCodecs — lowest latency. When false, it streams fragmented
+    /// MP4 played via MediaSource (higher latency, but works on browsers without WebCodecs).
+    /// </summary>
+    public bool VideoLowLatency { get; set; } = true;
     public int GuestInviteDefaultMinutes { get; set; } = 60;
     public bool StartWithWindows { get; set; } = false;
     public bool StartMinimized { get; set; } = true;

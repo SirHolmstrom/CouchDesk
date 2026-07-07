@@ -10,6 +10,7 @@ const kbdBtn = document.getElementById('kbdBtn');
 let ws, pingTimer;
 let queue = [], processing = false;
 let sessionInfo = null;
+let videoRenderer = null; // set when the server streams hardware H.264 (MediaSource path)
 
 function applySessionInfo(info) {
   sessionInfo = info;
@@ -64,7 +65,18 @@ function connect() {
 }
 function onMessage(ev) {
   if (typeof ev.data === 'string') { handleControl(JSON.parse(ev.data)); return; }
-  // Binary = a frame of changed tiles. Process in order (deltas must not be dropped).
+  // Route by leading type byte: 4 = per-frame H.264 (WebCodecs), 3 = fragmented MP4 (MSE),
+  // else JPEG tiles.
+  if (videoRenderer) {
+    const t = new Uint8Array(ev.data, 0, 1)[0];
+    if (t === 4) { // [type][flags(bit0=keyframe)][annexB]
+      const flags = new Uint8Array(ev.data, 1, 1)[0];
+      videoRenderer.decode(new Uint8Array(ev.data, 2), (flags & 1) === 1, performance.now());
+      return;
+    }
+    if (t === 3) { videoRenderer.appendChunk(new Uint8Array(ev.data, 1)); return; }
+  }
+  // Binary tiles = a frame of changed regions. Process in order (deltas must not drop).
   queue.push(ev.data);
   if (!processing) processQueue();
 }
@@ -105,6 +117,24 @@ function handleControl(m) {
     case 'pong': latEl.textContent = Math.round(performance.now() - m.ts) + ' ms'; break;
     case 'monitors': fillMonitors(m.list, m.active); break;
     case 'status': {
+      if (m.state === 'video-h264') { // low-latency per-frame H.264 via WebCodecs
+        if (!videoRenderer && window.RDVideo && RDVideo.supported) {
+          videoRenderer = RDVideo.create(cv, { onResize: fitView, onNeedKeyframe: () => send({ t: 'keyframe' }) });
+          setStatus('connected · H.264 (low latency)', 'ok');
+        } else if (!window.RDVideo || !RDVideo.supported) {
+          setStatus('WebCodecs not supported here', 'bad');
+        }
+        break;
+      }
+      if (m.state === 'video') { // fragmented MP4 via MediaSource
+        if (!videoRenderer && window.RDMse && RDMse.supported) {
+          videoRenderer = RDMse.create(cv, { onResize: fitView });
+          setStatus('connected · H.264', 'ok');
+        } else if (!window.RDMse || !RDMse.supported) {
+          setStatus('H.264 not supported here', 'bad');
+        }
+        break;
+      }
       const label = m.state === 'disabled' ? 'disabled by host'
         : m.state === 'access-revoked' ? 'guest access ended'
         : m.state;

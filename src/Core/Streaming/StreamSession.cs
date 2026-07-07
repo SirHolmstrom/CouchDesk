@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.WebSockets;
 using System.Runtime.Versioning;
@@ -7,6 +8,7 @@ using Core.Config;
 using Core.Input;
 using Core.Logging;
 using Core.Security;
+using Capture.Gpu;
 
 namespace Core.Streaming;
 
@@ -84,7 +86,11 @@ public sealed class StreamSession : IDisposable
         await SendStatusAsync("connected");
 
         var receive = ReceiveLoopAsync(m_Cancellation.Token);
-        var send = SendLoopAsync(m_Cancellation.Token);
+        var send = m_Config.UseHardwareVideo
+            ? (m_Config.VideoLowLatency
+                ? WebCodecsSendLoopAsync(m_Cancellation.Token)   // per-frame H.264 → WebCodecs
+                : VideoSendLoopAsync(m_Cancellation.Token))      // fragmented MP4 → MSE
+            : SendLoopAsync(m_Cancellation.Token);               // JPEG tiles
 
         await Task.WhenAny(receive, send); // whichever ends first…
         m_Cancellation.Cancel();           // …tears down the other
@@ -96,6 +102,218 @@ public sealed class StreamSession : IDisposable
 
     /// <summary>Used by the registry / tray "disconnect" action.</summary>
     public void Cancel() => m_Cancellation.Cancel();
+
+    // ---------- hardware-video send loop (GPU capture + hardware H.264, fragmented MP4) ----------
+    // Captures on the GPU and hardware-encodes to a fragmented-MP4 temp file, then tails
+    // that file and pushes new bytes to the client (which plays them via MediaSource).
+    // Binary video messages carry a 1-byte type prefix (3) so the client routes them apart
+    // from the JPEG-tile frames (type 1). Monitor/fps/bitrate are taken at connect time;
+    // changing them mid-session applies on reconnect (the tile path stays fully live).
+    private async Task VideoSendLoopAsync(CancellationToken ct)
+    {
+        await SendStatusAsync("video"); // tell the client to switch to the MSE renderer
+
+        string tempPath = Path.Combine(Path.GetTempPath(), $"rdl_{Id}.mp4");
+        DesktopDuplicationSource? source = null;
+        H264StreamEncoder? encoder = null;
+        Task? captureTask = null;
+        try
+        {
+            int fps = Math.Clamp(m_Fps, 1, 60);
+            int bitrate = Math.Clamp(m_Config.VideoBitrateKbps, 500, 100_000) * 1000;
+            source = new DesktopDuplicationSource(m_Monitor);
+            encoder = new H264StreamEncoder(tempPath, source.Width, source.Height, fps, bitrate);
+
+            var capSource = source;
+            var capEncoder = encoder;
+            captureTask = Task.Run(() => CaptureLoop(capSource, capEncoder, fps, ct), ct);
+
+            // Tail the fragmented-MP4 file: FlagsAllowWriteSharing on the MF side + this
+            // shared read handle let us read what MF is still writing.
+            using var reader = new FileStream(
+                tempPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            var buffer = new byte[64 * 1024];
+            var framed = new byte[buffer.Length + 1];
+            framed[0] = 3; // video-chunk marker
+            long position = 0;
+
+            while (!ct.IsCancellationRequested && m_Socket.State == WebSocketState.Open)
+            {
+                if (!m_IsAccessStillValid()) { await SendStatusAsync("access-revoked"); break; }
+                if (!m_IsLanClient && !m_Config.RemoteAccessEnabled) { await SendStatusAsync("disabled"); break; }
+
+                long length = reader.Length;
+                if (length > position)
+                {
+                    reader.Seek(position, SeekOrigin.Begin);
+                    int toRead = (int)Math.Min(buffer.Length, length - position);
+                    int read = await reader.ReadAsync(buffer.AsMemory(0, toRead), ct);
+                    if (read > 0)
+                    {
+                        Buffer.BlockCopy(buffer, 0, framed, 1, read);
+                        try { await SendRawAsync(framed.AsMemory(0, read + 1), WebSocketMessageType.Binary, ct); }
+                        catch { break; }
+                        position += read;
+                    }
+                }
+                else
+                {
+                    try { await Task.Delay(8, ct); } catch { break; }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            AuditLogger.Log("VIDEO_ERROR", ClientIp, ex.Message);
+        }
+        finally
+        {
+            m_Cancellation.Cancel();
+            if (captureTask is not null) { try { await captureTask; } catch { } }
+            try { encoder?.Finish(); } catch { }
+            encoder?.Dispose();
+            source?.Dispose();
+            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+        }
+    }
+
+    // Feeds captured BGRA frames to the encoder at the target FPS on a worker thread.
+    private void CaptureLoop(DesktopDuplicationSource source, H264StreamEncoder encoder, int fps, CancellationToken ct)
+    {
+        try
+        {
+            var stopwatch = Stopwatch.StartNew();
+            byte[]? last = source.TryAcquire(500)?.Bgra;
+            int submitted = 0;
+            int interval = 1000 / Math.Clamp(fps, 1, 60);
+
+            while (!ct.IsCancellationRequested && m_Socket.State == WebSocketState.Open)
+            {
+                DesktopFrame? frame;
+                try { frame = source.TryAcquire(interval); }
+                catch (Exception ex) { AuditLogger.Log("CAPTURE_ERROR", ClientIp, ex.Message); break; }
+
+                byte[] bgra = frame?.Bgra ?? last ?? Array.Empty<byte>();
+                if (bgra.Length == 0) continue;
+                last = bgra;
+
+                // Force an IDR ~twice a second: the fragmented-MP4 sink starts a new
+                // streamable fragment at each key frame, so shorter intervals mean smaller
+                // fragments and lower end-to-end latency (matters most for video content).
+                int keyEvery = Math.Max(1, fps / 2);
+                bool key = submitted == 0 || m_ForceKeyframe || submitted % keyEvery == 0;
+                if (m_ForceKeyframe) m_ForceKeyframe = false;
+
+                try { encoder.Encode(bgra, stopwatch.Elapsed, key); }
+                catch (Exception ex) { AuditLogger.Log("VIDEO_ENCODE_ERROR", ClientIp, ex.Message); break; }
+                submitted++;
+
+                long target = (long)(submitted * 1000.0 / fps);
+                int behind = (int)(target - stopwatch.ElapsedMilliseconds);
+                if (behind > 0) { try { Thread.Sleep(behind); } catch { } }
+            }
+        }
+        finally
+        {
+            m_Cancellation.Cancel(); // ensure the tailing loop tears down if capture ends
+        }
+    }
+
+    // ---------- low-latency WebCodecs send loop (per-frame H.264, no container) ----------
+    // Encodes one Annex-B access unit per frame and pushes it immediately as a binary
+    // message [u8 type=4][u8 flags(bit0=keyframe)][annexB...]. No fragment buffering, so
+    // latency drops toward capture + network + decode. The browser decodes with WebCodecs.
+    private async Task WebCodecsSendLoopAsync(CancellationToken ct)
+    {
+        await SendStatusAsync("video-h264");
+
+        DesktopDuplicationSource? source = null;
+        H264LowLatencyEncoder? encoder = null;
+        Task? captureTask = null;
+        var queue = new BlockingCollection<EncodedVideoFrame>(120);
+        try
+        {
+            int fps = Math.Clamp(m_Fps, 1, 60);
+            int bitrate = Math.Clamp(m_Config.VideoBitrateKbps, 500, 100_000) * 1000;
+            source = new DesktopDuplicationSource(m_Monitor);
+            encoder = new H264LowLatencyEncoder(source.Width, source.Height, fps, bitrate);
+            encoder.FrameEncoded += f =>
+            {
+                if (!queue.IsAddingCompleted && !queue.TryAdd(f))
+                    m_ForceKeyframe = true; // had to drop a frame → resync with a fresh IDR
+            };
+
+            var capSource = source;
+            var capEncoder = encoder;
+            captureTask = Task.Run(() => CaptureLoopLowLatency(capSource, capEncoder, fps, ct), ct);
+
+            while (!ct.IsCancellationRequested && m_Socket.State == WebSocketState.Open)
+            {
+                if (!m_IsAccessStillValid()) { await SendStatusAsync("access-revoked"); break; }
+                if (!m_IsLanClient && !m_Config.RemoteAccessEnabled) { await SendStatusAsync("disabled"); break; }
+
+                EncodedVideoFrame frame;
+                try { if (!queue.TryTake(out frame, 100, ct)) continue; }
+                catch { break; }
+
+                var msg = new byte[2 + frame.AnnexB.Length];
+                msg[0] = 4;
+                msg[1] = (byte)(frame.IsKeyframe ? 1 : 0);
+                Buffer.BlockCopy(frame.AnnexB, 0, msg, 2, frame.AnnexB.Length);
+                try { await SendRawAsync(msg, WebSocketMessageType.Binary, ct); }
+                catch { break; }
+            }
+        }
+        catch (Exception ex)
+        {
+            AuditLogger.Log("VIDEO_ERROR", ClientIp, ex.Message);
+        }
+        finally
+        {
+            m_Cancellation.Cancel();
+            try { queue.CompleteAdding(); } catch { }
+            if (captureTask is not null) { try { await captureTask; } catch { } }
+            encoder?.Dispose();
+            source?.Dispose();
+            try { queue.Dispose(); } catch { }
+        }
+    }
+
+    private void CaptureLoopLowLatency(DesktopDuplicationSource source, H264LowLatencyEncoder encoder, int fps, CancellationToken ct)
+    {
+        try
+        {
+            var stopwatch = Stopwatch.StartNew();
+            byte[]? last = source.TryAcquire(500)?.Bgra;
+            int submitted = 0;
+            int interval = 1000 / Math.Clamp(fps, 1, 60);
+
+            while (!ct.IsCancellationRequested && m_Socket.State == WebSocketState.Open)
+            {
+                DesktopFrame? frame;
+                try { frame = source.TryAcquire(interval); }
+                catch (Exception ex) { AuditLogger.Log("CAPTURE_ERROR", ClientIp, ex.Message); break; }
+
+                byte[] bgra = frame?.Bgra ?? last ?? Array.Empty<byte>();
+                if (bgra.Length == 0) continue;
+                last = bgra;
+
+                // Per-frame delivery needs a key frame only at start / on a control change;
+                // the encoder's own GOP handles periodic IDRs, so full-frame resends are rare.
+                bool key = submitted == 0 || m_ForceKeyframe;
+                if (m_ForceKeyframe) m_ForceKeyframe = false;
+
+                try { encoder.Encode(bgra, stopwatch.Elapsed, key); }
+                catch (Exception ex) { AuditLogger.Log("VIDEO_ENCODE_ERROR", ClientIp, ex.Message); break; }
+                submitted++;
+
+                long target = (long)(submitted * 1000.0 / fps);
+                int behind = (int)(target - stopwatch.ElapsedMilliseconds);
+                if (behind > 0) { try { Thread.Sleep(behind); } catch { } }
+            }
+        }
+        finally { m_Cancellation.Cancel(); }
+    }
 
     // ---------- send loop ----------
     private async Task SendLoopAsync(CancellationToken ct)
@@ -260,6 +478,9 @@ public sealed class StreamSession : IDisposable
 
                 // ----- latency -----
                 case "ping": await SendTextAsync(new { t = "pong", ts = message["ts"].GetDouble() }, ct); break;
+
+                // ----- WebCodecs decoder asks for a fresh IDR (startup / loss recovery) -----
+                case "keyframe": m_ForceKeyframe = true; break;
 
                 // ----- read focused field text (UI Automation), for the keyboard echo -----
                 case "getFocusText":
