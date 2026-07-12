@@ -1,4 +1,5 @@
 using Core.Hosting;
+using Core.Branding;
 using Core.RemoteAccess;
 using WinForms = System.Windows.Forms;
 
@@ -10,6 +11,8 @@ namespace Core.Tray;
 /// </summary>
 internal sealed class TaskbarStatusForm : WinForms.Form
 {
+    private static readonly System.Drawing.Color BrandOrange = System.Drawing.Color.FromArgb(255, 122, 26);
+    private static readonly System.Drawing.Color BrandInk = System.Drawing.Color.FromArgb(33, 16, 6);
     private readonly RemoteDesktopHost m_Host;
     private readonly RemoteAccessController m_Remote;
     private readonly TrayStatusIcons m_Icons;
@@ -30,7 +33,7 @@ internal sealed class TaskbarStatusForm : WinForms.Form
         m_Remote = remote;
         m_Icons = icons;
 
-        Text = "RemoteDesktopLAN";
+        Text = ProductInfo.Name;
         Width = 390;
         Height = 205;
         FormBorderStyle = WinForms.FormBorderStyle.FixedSingle;
@@ -43,8 +46,9 @@ internal sealed class TaskbarStatusForm : WinForms.Form
 
         var heading = new WinForms.Label
         {
-            Text = "RemoteDesktopLAN",
+            Text = ProductInfo.Name,
             Font = new System.Drawing.Font(Font, System.Drawing.FontStyle.Bold),
+            ForeColor = BrandOrange,
             AutoSize = true,
             Left = 18,
             Top = 16
@@ -70,6 +74,7 @@ internal sealed class TaskbarStatusForm : WinForms.Form
             Height = 30
         };
         dashboard.Click += (_, _) => openDashboard();
+        StylePrimaryButton(dashboard);
         var controls = new WinForms.Button
         {
             Text = "Tray Controls",
@@ -79,6 +84,8 @@ internal sealed class TaskbarStatusForm : WinForms.Form
             Height = 30
         };
         controls.Click += (_, _) => showTrayMenu();
+        controls.FlatStyle = WinForms.FlatStyle.Flat;
+        controls.FlatAppearance.BorderColor = BrandOrange;
 
         Controls.AddRange(new WinForms.Control[]
         {
@@ -96,7 +103,7 @@ internal sealed class TaskbarStatusForm : WinForms.Form
             ? System.Drawing.Color.FromArgb(34, 197, 94)
             : System.Drawing.Color.FromArgb(239, 68, 68);
         m_LanText.Text = m_Host.IsRunning
-            ? $"LAN access active — {m_Host.LanIp}:{m_Host.Port}"
+            ? $"LAN access active at {m_Host.LanIp}:{m_Host.Port}"
             : "LAN access stopped";
 
         (m_RemoteDot.ForeColor, m_RemoteText.Text) = m_Remote.State switch
@@ -160,5 +167,14 @@ internal sealed class TaskbarStatusForm : WinForms.Form
         dot.Top = top - 5;
         text.Left = 45;
         text.Top = top;
+    }
+
+    private static void StylePrimaryButton(WinForms.Button button)
+    {
+        button.FlatStyle = WinForms.FlatStyle.Flat;
+        button.FlatAppearance.BorderSize = 0;
+        button.BackColor = BrandOrange;
+        button.ForeColor = BrandInk;
+        button.Font = new System.Drawing.Font(button.Font, System.Drawing.FontStyle.Bold);
     }
 }

@@ -16,3 +16,6 @@ config.json
 .vs/
 .idea/
 *.suo
+
+# Local assistant workspace metadata
+.agents/

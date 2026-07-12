@@ -8,8 +8,10 @@ public sealed record FirewallOperationResult(bool Success, string Message);
 
 public sealed class FirewallRuleService
 {
-    private const string LanRuleName = "RemoteDesktopLAN LAN";
-    private const string PublicRuleName = "RemoteDesktopLAN Public";
+    private const string LanRuleName = "CouchDesk LAN";
+    private const string PublicRuleName = "CouchDesk Public";
+    private const string LegacyLanRuleName = "RemoteDesktopLAN LAN";
+    private const string LegacyPublicRuleName = "RemoteDesktopLAN Public";
 
     public Task<FirewallOperationResult> EnsureLanRuleAsync(int port) =>
         ReplaceRuleAsync(LanRuleName, port, "LocalSubnet");
@@ -19,7 +21,7 @@ public sealed class FirewallRuleService
 
     public Task<FirewallOperationResult> RemovePublicRuleAsync() =>
         RunElevatedPowerShellAsync(
-            $"Get-NetFirewallRule -DisplayName '{PublicRuleName}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction Stop");
+            $"Get-NetFirewallRule -DisplayName '{PublicRuleName}','{LegacyPublicRuleName}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction Stop");
 
     private static Task<FirewallOperationResult> ReplaceRuleAsync(
         string displayName,
@@ -27,7 +29,7 @@ public sealed class FirewallRuleService
         string remoteAddress)
     {
         string command =
-            $"Get-NetFirewallRule -DisplayName '{displayName}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule; " +
+            $"Get-NetFirewallRule -DisplayName '{displayName}','{LegacyLanRuleName}','{LegacyPublicRuleName}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule; " +
             $"New-NetFirewallRule -DisplayName '{displayName}' -Direction Inbound -Action Allow " +
             $"-Protocol TCP -LocalPort {port} -RemoteAddress {remoteAddress} -Profile Any -ErrorAction Stop | Out-Null";
         return RunElevatedPowerShellAsync(command);

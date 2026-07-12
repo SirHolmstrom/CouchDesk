@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>Core</RootNamespace>
-    <AssemblyName>RemoteDesktopLAN</AssemblyName>
+    <AssemblyName>CouchDesk</AssemblyName>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <!-- Pulls in System.Windows.Automation (UI Automation client) so the server can
          read the focused field's text for the keyboard echo. -->
@@ -16,7 +16,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- GPU capture + hardware H.264 streaming (opt-in via AppConfig.UseHardwareVideo). -->
+    <!-- GPU capture + low-latency hardware H.264 streaming with JPEG fallback. -->
     <ProjectReference Include="..\Capture.Gpu\Capture.Gpu.csproj" />
   </ItemGroup>
 

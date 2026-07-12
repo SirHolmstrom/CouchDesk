@@ -1,16 +1,93 @@
-// Remote Desktop LAN — browser viewer client (mouse + touch + on-screen keyboard).
+// CouchDesk browser viewer client (mouse + touch + on-screen keyboard).
 
 const cv = document.getElementById('screen');
 const ctx = cv.getContext('2d');
 const stage = document.getElementById('stage');
+const remoteCursorEl = document.getElementById('remoteCursor');
 const statEl = document.getElementById('stat');
 const latEl = document.getElementById('lat');
 const kbdBtn = document.getElementById('kbdBtn');
 
-let ws, pingTimer;
+// Mirrored by StreamBinaryMessageType on the host. JavaScript has no native enum,
+// so freeze the mapping to keep packet discriminators explicit and immutable.
+const BinaryMessageType = Object.freeze({
+  JpegTiles: 1,
+  FragmentedMp4: 3,
+  H264AnnexB: 4,
+  PointerMove: 5,
+  CursorState: 6,
+});
+
+let ws, controlWs, pingTimer, networkPingTimer, reconnectTimer, controlReconnectTimer, idlePauseTimer;
 let queue = [], processing = false;
 let sessionInfo = null;
 let videoRenderer = null; // set when the server streams hardware H.264 (MediaSource path)
+let reconnectAttempts = 0;
+let controlReconnectAttempts = 0;
+let controlToken = '';
+let manualDisconnect = false;
+let resumeRunning = false;
+let lastPongAt = 0;
+let streamMode = 'jpeg';
+let hostPerf = null;
+let clientPerf = null;
+let networkRtt = 0;
+let networkRttAt = 0;
+let networkPingRunning = false;
+let previousGc = null;
+let lastSpikeAt = 0;
+let lastSpikeSummary = '';
+let lastSpikeReportAt = 0;
+let browserEventLoopPeak = 0;
+let browserLongTaskPeak = 0;
+
+// A WebSocket message can arrive promptly but be handled late if Chrome's main
+// thread pauses. Keep browser scheduling separate from network latency.
+const browserLoopProbeMs = 100;
+let browserLoopExpectedAt = performance.now() + browserLoopProbeMs;
+setInterval(() => {
+  const now = performance.now();
+  if (document.visibilityState === 'visible')
+    browserEventLoopPeak = Math.max(browserEventLoopPeak, now - browserLoopExpectedAt);
+  browserLoopExpectedAt = now + browserLoopProbeMs;
+}, browserLoopProbeMs);
+
+try {
+  if (window.PerformanceObserver
+      && PerformanceObserver.supportedEntryTypes?.includes('longtask')) {
+    new PerformanceObserver(list => {
+      for (const entry of list.getEntries())
+        browserLongTaskPeak = Math.max(browserLongTaskPeak, entry.duration);
+    }).observe({ type: 'longtask', buffered: false });
+  }
+} catch (e) {}
+
+function takeBrowserResponsivenessStats() {
+  const result = {
+    eventLoopPeakMs: Math.max(0, browserEventLoopPeak),
+    longTaskPeakMs: Math.max(0, browserLongTaskPeak),
+  };
+  browserEventLoopPeak = 0;
+  browserLongTaskPeak = 0;
+  return result;
+}
+
+// ---------------- adaptive stream quality ----------------
+const adaptiveLevels = [
+  { fps: 30, quality: 75, bitratePercent: 100, label: 'best' },
+  { fps: 20, quality: 68, bitratePercent: 75, label: 'steady' },
+  { fps: 15, quality: 58, bitratePercent: 55, label: 'saving bandwidth' },
+  { fps: 10, quality: 48, bitratePercent: 35, label: 'recovering' },
+];
+let adaptiveEnabled = true;
+let adaptiveLevel = 0;
+let adaptiveLatency = 0;
+let lastHealthRtt = 0;
+let adaptiveGoodSince = 0;
+let adaptiveLastChange = 0;
+let streamFps = adaptiveLevels[0].fps;
+let streamQuality = adaptiveLevels[0].quality;
+let streamBitratePercent = adaptiveLevels[0].bitratePercent;
 
 function applySessionInfo(info) {
   sessionInfo = info;
@@ -31,11 +108,16 @@ function applySessionInfo(info) {
   if (!allowed.system) document.getElementById('syskeys').classList.add('hidden');
   const role = info.role === 'guest' ? `guest · ${info.accessLevel}` : 'owner';
   document.getElementById('sessionRole').textContent = role;
+  if (allowed.control) setRemoteCursor(curX, curY, true);
 }
 
 // ---------------- zoom / pan ----------------
 let scale = 1, minScale = 1, tx = 0, ty = 0;
-function applyTransform() { cv.style.transform = `translate(${tx}px,${ty}px) scale(${scale})`; }
+const clamp01 = v => Math.min(1, Math.max(0, v));
+function applyTransform() {
+  cv.style.transform = `translate(${tx}px,${ty}px) scale(${scale})`;
+  positionRemoteCursor();
+}
 function fitView() {
   const vw = stage.clientWidth, vh = stage.clientHeight;
   if (!cv.width || !cv.height || !vw || !vh) return;
@@ -54,28 +136,234 @@ function clampView() {
 }
 window.addEventListener('resize', fitView);
 
+// ---------------- remote cursor overlay ----------------
+// Visible by default: if the server cursor feed breaks, the user still gets a
+// local pointer marker instead of staring at an invisible cursor.
+let remoteCursor = { visible: true, x: 0.5, y: 0.5 };
+const REMOTE_INPUT_PRIORITY_MS = 4000;
+let remoteInputPriorityUntil = 0;
+let steeringBlockedUntil = 0;
+let pendingServerCursor = null, lastServerCursor = null, serverCursorSnapTimer = 0;
+function canControl() { return !!sessionInfo?.permissions?.canControl; }
+function isSteeringBlocked() { return performance.now() < steeringBlockedUntil; }
+function beginPointerAction() {
+  if (!canControl() || isSteeringBlocked()) return false;
+  markLocalCursorInput();
+  return true;
+}
+function markLocalCursorInput() {
+  remoteInputPriorityUntil = performance.now() + REMOTE_INPUT_PRIORITY_MS;
+  scheduleServerCursorSnap();
+}
+function setRemoteCursor(x, y, visible = true) {
+  remoteCursor = { visible: visible !== false || canControl(), x: clamp01(+x || 0), y: clamp01(+y || 0) };
+  positionRemoteCursor();
+}
+function applyServerCursor(m) {
+  lastServerCursor = m;
+  pendingServerCursor = null;
+  if (serverCursorSnapTimer) {
+    clearTimeout(serverCursorSnapTimer);
+    serverCursorSnapTimer = 0;
+  }
+  setRemoteCursor(m.x, m.y, m.visible);
+  if (m.visible && canControl()) { curX = clamp01(m.x); curY = clamp01(m.y); }
+}
+function scheduleServerCursorSnap() {
+  if (!pendingServerCursor) return;
+  if (serverCursorSnapTimer) clearTimeout(serverCursorSnapTimer);
+  const wait = Math.max(0, remoteInputPriorityUntil - performance.now());
+  serverCursorSnapTimer = setTimeout(() => {
+    serverCursorSnapTimer = 0;
+    if (!pendingServerCursor) return;
+    if (performance.now() < remoteInputPriorityUntil) {
+      scheduleServerCursorSnap();
+      return;
+    }
+    applyServerCursor(pendingServerCursor);
+  }, wait);
+}
+function positionRemoteCursor() {
+  if (!remoteCursorEl) return;
+  if (!remoteCursor.visible) {
+    remoteCursorEl.classList.add('hidden');
+    return;
+  }
+  const width = cv.width || stage.clientWidth || 1;
+  const height = cv.height || stage.clientHeight || 1;
+  const x = tx + remoteCursor.x * width * scale;
+  const y = ty + remoteCursor.y * height * scale;
+  const zoomRatio = minScale > 0 ? scale / minScale : 1;
+  const cursorScale = Math.max(0.3, Math.min(1, 0.3 + 0.7 * (1 - Math.exp(-0.35 * Math.max(0, zoomRatio - 1)))));
+  remoteCursorEl.classList.toggle('smooth', !canControl() || performance.now() >= remoteInputPriorityUntil);
+  remoteCursorEl.style.transform = `translate3d(${x - 3}px,${y - 3}px,0) scale(${cursorScale})`;
+  remoteCursorEl.classList.remove('hidden');
+}
+positionRemoteCursor();
+
 // ---------------- connection ----------------
 function connect() {
-  ws = new WebSocket(`wss://${location.host}/ws`);
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { setStatus('connected', 'ok'); startPing(); };
-  ws.onclose = () => { setStatus('disconnected', 'bad'); clearInterval(pingTimer); };
-  ws.onerror = () => { setStatus('error', 'bad'); };
-  ws.onmessage = onMessage;
+  if (manualDisconnect) return;
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  closeControlChannel(true);
+  clearTimeout(reconnectTimer);
+  const socket = new WebSocket(`wss://${location.host}/ws`);
+  ws = socket;
+  socket.binaryType = 'arraybuffer';
+  socket.onopen = () => {
+    if (ws !== socket) {
+      try { socket.close(); } catch (e) {}
+      return;
+    }
+    reconnectAttempts = 0;
+    lastPongAt = performance.now();
+    setStatus('connected', 'ok');
+    startPing();
+    startNetworkPing();
+    requestWakeLock();
+    if (adaptiveEnabled) applyAdaptiveLevel(true);
+  };
+  socket.onclose = () => {
+    if (ws !== socket) return;
+    ws = null;
+    closeControlChannel(true);
+    clearInterval(pingTimer);
+    stopNetworkPing();
+    resetVideoRenderer();
+    if (manualDisconnect) return;
+    setStatus(document.visibilityState === 'visible' ? 'reconnecting…' : 'paused', 'wait');
+    scheduleReconnect();
+  };
+  socket.onerror = () => {
+    if (ws === socket) setStatus(navigator.onLine === false ? 'offline' : 'connection issue', 'bad');
+  };
+  socket.onmessage = event => {
+    if (ws === socket) onMessage(event);
+  };
+}
+
+function connectControl(token) {
+  if (manualDisconnect || !token) return;
+  if (token !== controlToken) {
+    closeControlChannel(true);
+    controlToken = token;
+  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (controlWs && (controlWs.readyState === WebSocket.OPEN || controlWs.readyState === WebSocket.CONNECTING)) return;
+
+  clearTimeout(controlReconnectTimer);
+  const socket = new WebSocket(`wss://${location.host}/ws/control?token=${encodeURIComponent(controlToken)}`);
+  controlWs = socket;
+  socket.binaryType = 'arraybuffer';
+  socket.onopen = () => {
+    if (controlWs !== socket) {
+      try { socket.close(); } catch (e) {}
+      return;
+    }
+    controlReconnectAttempts = 0;
+    lastPongAt = performance.now();
+  };
+  socket.onmessage = event => {
+    if (controlWs !== socket) return;
+    if (typeof event.data === 'string') {
+      try { handleControl(JSON.parse(event.data)); } catch (e) {}
+      return;
+    }
+    const bytes = new Uint8Array(event.data);
+    if (bytes[0] === BinaryMessageType.CursorState) handleBinaryCursor(bytes);
+  };
+  socket.onclose = () => {
+    if (controlWs !== socket) return;
+    controlWs = null;
+    if (!manualDisconnect && ws?.readyState === WebSocket.OPEN && document.visibilityState === 'visible')
+      scheduleControlReconnect();
+  };
+  socket.onerror = () => {};
+}
+
+function scheduleControlReconnect() {
+  if (manualDisconnect || !controlToken || ws?.readyState !== WebSocket.OPEN) return;
+  clearTimeout(controlReconnectTimer);
+  const delay = Math.min(5000, 250 * Math.pow(1.6, controlReconnectAttempts++));
+  controlReconnectTimer = setTimeout(() => connectControl(controlToken), delay);
+}
+
+function closeControlChannel(clearToken) {
+  clearTimeout(controlReconnectTimer);
+  controlReconnectTimer = 0;
+  controlReconnectAttempts = 0;
+  const socket = controlWs;
+  controlWs = null;
+  if (clearToken) controlToken = '';
+  if (socket && socket.readyState < WebSocket.CLOSING) {
+    try { socket.close(1000, 'video channel closed'); } catch (e) {}
+  }
+}
+
+function controlSocket() {
+  return controlWs?.readyState === WebSocket.OPEN ? controlWs : ws;
+}
+
+function scheduleReconnect() {
+  if (manualDisconnect) return;
+  clearTimeout(reconnectTimer);
+  if (document.visibilityState !== 'visible') return;
+  if (navigator.onLine === false) {
+    setStatus('offline', 'wait');
+    return;
+  }
+  const delay = Math.min(10000, 500 * Math.pow(1.6, reconnectAttempts++));
+  reconnectTimer = setTimeout(resumeViewer, delay);
+}
+
+async function resumeViewer() {
+  if (manualDisconnect) return;
+  if (document.visibilityState !== 'visible') return;
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (resumeRunning) return;
+
+  resumeRunning = true;
+  setStatus('resuming…', 'wait');
+  try {
+    const r = await fetch('/api/session', { cache: 'no-store' });
+    if (r.status === 401 || r.status === 403) { location.href = '/login.html'; return; }
+    if (!r.ok) throw new Error(`Session check failed (${r.status})`);
+    applySessionInfo(await r.json());
+    resetVideoRenderer();
+    queue.length = 0;
+    connect();
+  } catch (e) {
+    setStatus(navigator.onLine === false ? 'offline' : 'reconnecting…', 'wait');
+    scheduleReconnect();
+  } finally {
+    resumeRunning = false;
+  }
+}
+
+function resetVideoRenderer() {
+  if (!videoRenderer) return;
+  try { videoRenderer.close && videoRenderer.close(); } catch (e) {}
+  videoRenderer = null;
 }
 function onMessage(ev) {
   if (typeof ev.data === 'string') { handleControl(JSON.parse(ev.data)); return; }
+  const bytes = new Uint8Array(ev.data);
+  const type = bytes[0];
+  if (type === BinaryMessageType.CursorState) {
+    handleBinaryCursor(bytes);
+    return;
+  }
   // Route by leading type byte: 4 = per-frame H.264 (WebCodecs), 3 = fragmented MP4 (MSE),
   // else JPEG tiles.
   if (videoRenderer) {
-    const t = new Uint8Array(ev.data, 0, 1)[0];
-    if (t === 4) { // [type][flags(bit0=keyframe)][annexB]
+    if (type === BinaryMessageType.H264AnnexB) { // [type][flags(bit0=keyframe)][annexB]
       const flags = new Uint8Array(ev.data, 1, 1)[0];
       videoRenderer.decode(new Uint8Array(ev.data, 2), (flags & 1) === 1, performance.now());
       return;
     }
-    if (t === 3) { videoRenderer.appendChunk(new Uint8Array(ev.data, 1)); return; }
+    if (type === BinaryMessageType.FragmentedMp4) { videoRenderer.appendChunk(new Uint8Array(ev.data, 1)); return; }
   }
+  if (type !== BinaryMessageType.JpegTiles) return;
   // Binary tiles = a frame of changed regions. Process in order (deltas must not drop).
   queue.push(ev.data);
   if (!processing) processQueue();
@@ -112,12 +400,76 @@ async function renderFrame(buf) {
     for (const t of tiles) { ctx.drawImage(t.bmp, t.x, t.y); t.bmp.close && t.bmp.close(); }
   } catch (e) {}
 }
+function handleBinaryCursor(bytes) {
+  if (bytes.byteLength !== 8) return;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const flags = bytes[1];
+  const sourceCode = (flags >> 1) & 0x03;
+  handleCursorUpdate({
+    visible: (flags & 0x01) !== 0,
+    x: view.getUint16(2, true) / 65535,
+    y: view.getUint16(4, true) / 65535,
+    source: sourceCode === 1 ? 'self' : sourceCode === 2 ? 'remote' : 'host',
+    hostBlockMs: view.getUint16(6, true),
+  });
+}
+
+function handleCursorUpdate(m) {
+  if (m.source === 'self' && canControl() && !isSteeringBlocked()) {
+    pendingServerCursor = null;
+    return;
+  }
+  const hostTakeover = m.source === 'host' && +m.hostBlockMs > 0;
+  if (hostTakeover) {
+    steeringBlockedUntil = Math.max(steeringBlockedUntil, performance.now() + +m.hostBlockMs);
+  }
+  if (hostTakeover || m.source === 'remote') {
+    remoteInputPriorityUntil = 0;
+  }
+  if (!hostTakeover && m.source !== 'remote' && canControl() && performance.now() < remoteInputPriorityUntil) {
+    pendingServerCursor = m;
+    scheduleServerCursorSnap();
+    return;
+  }
+  applyServerCursor(m);
+}
+
 function handleControl(m) {
   switch (m.t) {
-    case 'pong': latEl.textContent = Math.round(performance.now() - m.ts) + ' ms'; break;
+    case 'control-channel':
+      connectControl(m.token);
+      break;
+    case 'pong':
+      lastPongAt = performance.now();
+      const rtt = lastPongAt - m.ts;
+      if (m.perf) {
+        const gcDelta = previousGc
+          ? {
+              gc0: Math.max(0, m.perf.gc0 - previousGc.gc0),
+              gc1: Math.max(0, m.perf.gc1 - previousGc.gc1),
+              gc2: Math.max(0, m.perf.gc2 - previousGc.gc2),
+            }
+          : { gc0: 0, gc1: 0, gc2: 0 };
+        previousGc = { gc0: m.perf.gc0, gc1: m.perf.gc1, gc2: m.perf.gc2 };
+        hostPerf = { ...m.perf, gcDelta };
+      }
+      const responsiveness = takeBrowserResponsivenessStats();
+      clientPerf = videoRenderer && typeof videoRenderer.takeStats === 'function'
+        ? { ...videoRenderer.takeStats(), ...responsiveness }
+        : responsiveness;
+      if (rtt >= 80 && hostPerf) {
+        lastSpikeAt = performance.now();
+        lastSpikeSummary = `Spike ${Math.round(rtt)} · net ${networkRtt ? Math.round(networkRtt) : '--'} · map ${Math.round(+hostPerf.captureMapPeakMs || 0)} · loop ${Math.round(+clientPerf.eventLoopPeakMs || 0)} ms`;
+        reportStreamSpike(rtt);
+      }
+      latEl.textContent = Math.round(rtt) + ' ms';
+      noteAdaptiveSample(rtt);
+      break;
     case 'monitors': fillMonitors(m.list, m.active); break;
     case 'status': {
       if (m.state === 'video-h264') { // low-latency per-frame H.264 via WebCodecs
+        streamMode = 'h264';
+        updateAdaptiveUi();
         if (!videoRenderer && window.RDVideo && RDVideo.supported) {
           videoRenderer = RDVideo.create(cv, { onResize: fitView, onNeedKeyframe: () => send({ t: 'keyframe' }) });
           setStatus('connected · H.264 (low latency)', 'ok');
@@ -127,6 +479,8 @@ function handleControl(m) {
         break;
       }
       if (m.state === 'video') { // fragmented MP4 via MediaSource
+        streamMode = 'h264';
+        updateAdaptiveUi();
         if (!videoRenderer && window.RDMse && RDMse.supported) {
           videoRenderer = RDMse.create(cv, { onResize: fitView });
           setStatus('connected · H.264', 'ok');
@@ -138,11 +492,36 @@ function handleControl(m) {
       const label = m.state === 'disabled' ? 'disabled by host'
         : m.state === 'access-revoked' ? 'guest access ended'
         : m.state;
+      if (m.state === 'connected') {
+        streamMode = 'jpeg';
+        updateAdaptiveUi();
+      }
       setStatus(label, m.state === 'connected' ? 'ok' : 'bad');
       break;
     }
     // real text of the PC's focused field (UI Automation) → seed the echo so it matches reality
+    case 'cursor': handleCursorUpdate(m); break;
+    case 'steering':
+      if (m.state === 'blocked') {
+        steeringBlockedUntil = performance.now() + Math.max(250, +m.ms || 1000);
+        remoteInputPriorityUntil = 0;
+        if (pendingServerCursor) applyServerCursor(pendingServerCursor);
+        else if (lastServerCursor) applyServerCursor(lastServerCursor);
+      }
+      break;
     case 'focusText': echoBuf = (m.text || '').slice(-5000); echoRender(); break;
+    case 'kicked':
+      manualDisconnect = true;
+      clearTimeout(reconnectTimer);
+      clearTimeout(idlePauseTimer);
+      clearInterval(pingTimer);
+      stopNetworkPing();
+      releaseWakeLock();
+      setStatus('disconnected by host', 'bad');
+      closeControlChannel(true);
+      try { ws && ws.close(1000, 'kicked'); } catch (e) {}
+      setTimeout(() => { location.href = '/login.html'; }, 900);
+      break;
   }
 }
 function fillMonitors(list, active) {
@@ -164,12 +543,381 @@ function setStatus(s, level) { // level: 'ok' | 'wait' | 'bad'
   if (d2) d2.className = cls;
 }
 
+function getStreamBacklog() {
+  if (videoRenderer && typeof videoRenderer.pending === 'number') return videoRenderer.pending;
+  return queue.length + (processing ? 1 : 0);
+}
+
+function updateFpsButtons(value) {
+  document.querySelectorAll('#panel .seg button')
+    .forEach(b => b.classList.toggle('on', +b.dataset.fps === value));
+}
+
+function updateAdaptiveUi() {
+  const btn = document.getElementById('autoBtn');
+  const stat = document.getElementById('autoStat');
+  if (btn) {
+    btn.classList.toggle('on', adaptiveEnabled);
+    btn.textContent = adaptiveEnabled ? 'Auto' : 'Manual';
+  }
+  if (stat) {
+    const level = adaptiveLevels[adaptiveLevel];
+    const mode = streamMode === 'jpeg' ? 'JPEG' : 'H.264';
+    stat.textContent = adaptiveEnabled
+      ? `${level.label} · ${streamFps} fps · ${mode}`
+      : 'manual';
+  }
+  const q = document.getElementById('q');
+  if (q && +q.value !== streamQuality) q.value = streamQuality;
+  updateFpsButtons(streamFps);
+  updateHealthUi();
+}
+
+function updateHealthUi() {
+  const stateEl = document.getElementById('healthState');
+  const latencyEl = document.getElementById('healthLatency');
+  const queueEl = document.getElementById('healthQueue');
+  const codecEl = document.getElementById('healthCodec');
+  const perfEl = document.getElementById('perfStat');
+  if (!stateEl || !latencyEl || !queueEl || !codecEl) return;
+  const backlog = getStreamBacklog();
+  const avg = adaptiveLatency || lastHealthRtt;
+  const mode = streamMode === 'jpeg' ? 'JPEG' : 'H.264';
+  const state = backlog > 4 || avg > 150
+    ? 'busy'
+    : backlog > 1 || avg > 90
+      ? 'ok'
+      : 'good';
+  stateEl.textContent = lastHealthRtt ? state : 'waiting';
+  stateEl.className = `metric-value ${lastHealthRtt ? state : ''}`;
+  latencyEl.textContent = lastHealthRtt ? `${Math.round(lastHealthRtt)} ms` : '-- ms';
+  queueEl.textContent = String(backlog);
+  codecEl.textContent = mode;
+
+  if (perfEl && hostPerf) {
+    const capturePeak = +hostPerf.capturePeakMs || 0;
+    const captureAcquirePeak = +hostPerf.captureAcquirePeakMs || 0;
+    const captureCopyPeak = +hostPerf.captureCopyPeakMs || 0;
+    const captureMapPeak = +hostPerf.captureMapPeakMs || 0;
+    const captureCpuCopyPeak = +hostPerf.captureCpuCopyPeakMs || 0;
+    const encodePeak = +hostPerf.encodePeakMs || 0;
+    const controlSendWaitPeak = +hostPerf.controlSendWaitPeakMs || 0;
+    const controlSendPeak = +hostPerf.controlSendPeakMs || 0;
+    const sendWaitPeak = +hostPerf.sendWaitPeakMs || 0;
+    const sendPeak = +hostPerf.sendPeakMs || 0;
+    const sendTotalPeak = sendWaitPeak + sendPeak;
+    const paintPeak = +clientPerf?.paintPeakMs || 0;
+    const paintGapPeak = +clientPerf?.paintGapPeakMs || 0;
+    const gc = hostPerf.gcDelta || { gc0: 0, gc1: 0, gc2: 0 };
+    const showMs = value => value < 10 ? value.toFixed(1) : Math.round(value).toString();
+    const netLabel = networkRtt ? `Net ${Math.round(networkRtt)} · ` : '';
+    perfEl.textContent = lastSpikeSummary && performance.now() - lastSpikeAt < 10000
+      ? lastSpikeSummary
+      : `${netLabel}peak cap ${showMs(capturePeak)} · enc ${showMs(encodePeak)} · send ${showMs(sendTotalPeak)} ms`;
+    perfEl.classList.toggle(
+      'warn',
+      performance.now() - lastSpikeAt < 10000
+        || Math.max(capturePeak, encodePeak, sendTotalPeak, paintPeak) > 50);
+    perfEl.title = [
+      `Control channel: ${controlWs?.readyState === WebSocket.OPEN ? 'separate WebSocket' : 'video-socket fallback'}`,
+      `Independent network RTT: ${networkRtt ? Math.round(networkRtt) + ' ms' : 'waiting'}`,
+      `Control RTT: ${lastHealthRtt ? Math.round(lastHealthRtt) + ' ms' : 'waiting'}`,
+      `Host capture last/peak: ${showMs(+hostPerf.captureMs || 0)} / ${showMs(capturePeak)} ms`,
+      `  DXGI acquire peak: ${showMs(captureAcquirePeak)} ms (includes waiting for a desktop update)`,
+      `  GPU copy/map peak: ${showMs(captureCopyPeak)} / ${showMs(captureMapPeak)} ms`,
+      `  CPU pixel copy peak: ${showMs(captureCpuCopyPeak)} ms`,
+      `Host encode last/peak: ${showMs(+hostPerf.encodeMs || 0)} / ${showMs(encodePeak)} ms`,
+      `Control send wait/send peak: ${showMs(controlSendWaitPeak)} / ${showMs(controlSendPeak)} ms`,
+      `Send-lock wait last/peak: ${showMs(+hostPerf.sendWaitMs || 0)} / ${showMs(sendWaitPeak)} ms`,
+      `WebSocket send last/peak: ${showMs(+hostPerf.sendMs || 0)} / ${showMs(sendPeak)} ms`,
+      `Host queue current/peak: ${hostPerf.hostQueue || 0} / ${hostPerf.hostQueuePeak || 0}`,
+      `Encoded frame last/peak: ${Math.round((hostPerf.frameBytes || 0) / 1024)} / ${Math.round((hostPerf.framePeakBytes || 0) / 1024)} KB`,
+      `Video rate/target/applied: ${Math.round(hostPerf.videoKbps || 0)} / ${hostPerf.targetVideoBitrateKbps || 0} / ${hostPerf.appliedVideoBitrateKbps || 0} Kbps`,
+      `Video frames in sample: ${hostPerf.videoFrames || 0}`,
+      `Large frame paced in sample: ${hostPerf.pacedFrameSeen ? 'yes' : 'no'}`,
+      `Browser paint last/peak: ${showMs(+clientPerf?.paintMs || 0)} / ${showMs(paintPeak)} ms`,
+      `Browser frame gap last/peak: ${showMs(+clientPerf?.paintGapMs || 0)} / ${showMs(paintGapPeak)} ms`,
+      `Browser event-loop/long-task peak: ${showMs(+clientPerf?.eventLoopPeakMs || 0)} / ${showMs(+clientPerf?.longTaskPeakMs || 0)} ms`,
+      `Host timer drift peak: ${showMs(+hostPerf.hostTimerPeakMs || 0)} ms`,
+      `CPU CouchDesk/system: ${showMs(+hostPerf.processCpuPercent || 0)}% / ${showMs(+hostPerf.systemCpuPercent || 0)}%`,
+      `ThreadPool queue/threads: ${hostPerf.threadPoolQueue || 0} / ${hostPerf.threadPoolThreads || 0}`,
+      `Keyframe sent in sample: ${hostPerf.keyframeSeen ? 'yes' : 'no'}`,
+      `Host GC delta: gen0 ${gc.gc0}, gen1 ${gc.gc1}, gen2 ${gc.gc2}`,
+    ].join('\n');
+  }
+}
+
+function reportStreamSpike(streamRtt) {
+  const now = performance.now();
+  if (!hostPerf || now - lastSpikeReportAt < 5000) return;
+  lastSpikeReportAt = now;
+  const gc = hostPerf.gcDelta || { gc0: 0, gc1: 0, gc2: 0 };
+  const report = {
+    controlRttMs: streamRtt,
+    networkRttMs: networkRtt,
+    networkSampleAgeMs: networkRttAt ? now - networkRttAt : 0,
+    capturePeakMs: +hostPerf.capturePeakMs || 0,
+    captureAcquirePeakMs: +hostPerf.captureAcquirePeakMs || 0,
+    captureCopyPeakMs: +hostPerf.captureCopyPeakMs || 0,
+    captureMapPeakMs: +hostPerf.captureMapPeakMs || 0,
+    captureCpuCopyPeakMs: +hostPerf.captureCpuCopyPeakMs || 0,
+    encodePeakMs: +hostPerf.encodePeakMs || 0,
+    controlSendWaitPeakMs: +hostPerf.controlSendWaitPeakMs || 0,
+    controlSendPeakMs: +hostPerf.controlSendPeakMs || 0,
+    sendWaitPeakMs: +hostPerf.sendWaitPeakMs || 0,
+    sendPeakMs: +hostPerf.sendPeakMs || 0,
+    hostQueuePeak: +hostPerf.hostQueuePeak || 0,
+    framePeakBytes: +hostPerf.framePeakBytes || 0,
+    videoKbps: +hostPerf.videoKbps || 0,
+    videoFrames: +hostPerf.videoFrames || 0,
+    targetVideoBitrateKbps: +hostPerf.targetVideoBitrateKbps || 0,
+    appliedVideoBitrateKbps: +hostPerf.appliedVideoBitrateKbps || 0,
+    pacedFrameSeen: !!hostPerf.pacedFrameSeen,
+    decoderQueue: getStreamBacklog(),
+    paintPeakMs: +clientPerf?.paintPeakMs || 0,
+    paintGapPeakMs: +clientPerf?.paintGapPeakMs || 0,
+    browserEventLoopPeakMs: +clientPerf?.eventLoopPeakMs || 0,
+    browserLongTaskPeakMs: +clientPerf?.longTaskPeakMs || 0,
+    hostTimerPeakMs: +hostPerf.hostTimerPeakMs || 0,
+    processCpuPercent: +hostPerf.processCpuPercent || 0,
+    systemCpuPercent: +hostPerf.systemCpuPercent || 0,
+    threadPoolQueue: +hostPerf.threadPoolQueue || 0,
+    threadPoolThreads: +hostPerf.threadPoolThreads || 0,
+    keyframeSeen: !!hostPerf.keyframeSeen,
+    gc0: gc.gc0 || 0,
+    gc1: gc.gc1 || 0,
+    gc2: gc.gc2 || 0,
+    codec: streamMode,
+    fps: streamFps,
+  };
+  fetch('/api/diagnostics/spike', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(report),
+    keepalive: true,
+  }).catch(() => {});
+}
+
+function applyStreamSettings(fps, quality, force = false) {
+  fps = Math.max(1, Math.min(60, +fps || streamFps));
+  quality = Math.max(10, Math.min(95, +quality || streamQuality));
+  if (force || fps !== streamFps) send({ t: 'fps', v: fps });
+  // JPEG quality is live. H.264 quality is controlled separately as a percentage
+  // of the bitrate configured by the host.
+  if (streamMode === 'jpeg' && (force || quality !== streamQuality))
+    send({ t: 'quality', v: quality });
+  streamFps = fps;
+  streamQuality = quality;
+  updateAdaptiveUi();
+}
+
+function applyVideoBitratePercent(percent, force = false) {
+  percent = Math.max(25, Math.min(100, Math.round(+percent || 100)));
+  if (force || percent !== streamBitratePercent) send({ t: 'bitrate', v: percent });
+  streamBitratePercent = percent;
+}
+
+function applyAdaptiveLevel(force = false) {
+  if (!adaptiveEnabled) return;
+  const level = adaptiveLevels[adaptiveLevel];
+  applyStreamSettings(level.fps, level.quality, force);
+  applyVideoBitratePercent(level.bitratePercent, force);
+}
+
+function setAdaptiveEnabled(enabled) {
+  adaptiveEnabled = !!enabled;
+  adaptiveGoodSince = 0;
+  adaptiveLastChange = performance.now();
+  updateAdaptiveUi();
+  if (adaptiveEnabled) applyAdaptiveLevel(true);
+  else applyVideoBitratePercent(100, true);
+}
+
+function toggleAdaptive() {
+  setAdaptiveEnabled(!adaptiveEnabled);
+}
+
+function noteAdaptiveSample(rtt) {
+  lastHealthRtt = rtt;
+  if (!adaptiveEnabled || document.visibilityState !== 'visible') {
+    updateHealthUi();
+    return;
+  }
+
+  const now = performance.now();
+  adaptiveLatency = adaptiveLatency ? adaptiveLatency * 0.75 + rtt * 0.25 : rtt;
+  const backlog = getStreamBacklog();
+  const hostBacklog = +hostPerf?.hostQueuePeak || 0;
+  const bad = rtt > 120 || adaptiveLatency > 90 || backlog > 2 || hostBacklog > 1;
+  const good = rtt < 60 && adaptiveLatency < 50 && backlog <= 1 && hostBacklog <= 1;
+
+  if (bad && adaptiveLevel < adaptiveLevels.length - 1 && now - adaptiveLastChange > 2500) {
+    adaptiveLevel++;
+    adaptiveLastChange = now;
+    adaptiveGoodSince = 0;
+    applyAdaptiveLevel();
+    return;
+  }
+
+  if (good) {
+    if (!adaptiveGoodSince) adaptiveGoodSince = now;
+    if (adaptiveLevel > 0 && now - adaptiveGoodSince > 30000 && now - adaptiveLastChange > 15000) {
+      adaptiveLevel--;
+      adaptiveLastChange = now;
+      adaptiveGoodSince = 0;
+      applyAdaptiveLevel();
+      return;
+    }
+  } else {
+    adaptiveGoodSince = 0;
+  }
+
+  updateAdaptiveUi();
+}
+
 // ---------------- controls ----------------
-function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+function send(o) {
+  const socket = controlSocket();
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(o));
+}
 function setMonitor() { send({ t: 'monitor', v: +document.getElementById('mon').value }); }
-function setQuality() { send({ t: 'quality', v: +document.getElementById('q').value }); }
-function setFps()     { send({ t: 'fps',     v: +document.getElementById('fps').value }); }
-function startPing()  { clearInterval(pingTimer); pingTimer = setInterval(() => send({ t: 'ping', ts: performance.now() }), 1000); }
+function setQuality(manual = true) {
+  const quality = +document.getElementById('q').value;
+  if (manual) adaptiveEnabled = false;
+  applyStreamSettings(streamFps, quality);
+  if (manual && streamMode === 'h264')
+    applyVideoBitratePercent(25 + (quality - 10) * 75 / 85);
+}
+function setFps(manual = true) {
+  if (manual) {
+    adaptiveEnabled = false;
+    applyVideoBitratePercent(100);
+  }
+  applyStreamSettings(+document.getElementById('fps').value, streamQuality);
+}
+function startPing()  {
+  clearInterval(pingTimer);
+  pingTimer = setInterval(() => {
+    const now = performance.now();
+    if (document.visibilityState === 'visible'
+        && ws?.readyState === WebSocket.OPEN
+        && now - lastPongAt > 6000) {
+      try { ws.close(); } catch (e) {}
+      scheduleReconnect();
+      return;
+    }
+    send({ t: 'ping', ts: now });
+  }, 1000);
+}
+
+function startNetworkPing() {
+  stopNetworkPing();
+  sampleNetworkRtt();
+  networkPingTimer = setInterval(sampleNetworkRtt, 1000);
+}
+
+function stopNetworkPing() {
+  clearInterval(networkPingTimer);
+  networkPingTimer = 0;
+  networkPingRunning = false;
+}
+
+async function sampleNetworkRtt() {
+  if (networkPingRunning
+      || manualDisconnect
+      || document.visibilityState !== 'visible'
+      || navigator.onLine === false)
+    return;
+
+  networkPingRunning = true;
+  const startedAt = performance.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3000);
+  try {
+    const response = await fetch('/api/ping', { cache: 'no-store', signal: controller.signal });
+    if (response.ok) {
+      networkRttAt = performance.now();
+      networkRtt = networkRttAt - startedAt;
+    }
+  } catch (e) {
+    // The WebSocket reconnect state remains authoritative for connection failures.
+  } finally {
+    clearTimeout(timeout);
+    networkPingRunning = false;
+    updateHealthUi();
+  }
+}
+
+// ---------------- keep phone awake ----------------
+// Supported browsers can keep the screen awake while the viewer is active. The
+// lock is automatically released by the browser when the page is hidden, so we
+// ask again when the tab becomes visible.
+let wakeLock = null;
+let wakeLockWanted = false;
+async function requestWakeLock() {
+  wakeLockWanted = true;
+  if (wakeLock || document.visibilityState !== 'visible' || !navigator.wakeLock) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch (e) {
+    wakeLock = null;
+  }
+}
+function releaseWakeLock() {
+  wakeLockWanted = false;
+  if (!wakeLock) return;
+  const lock = wakeLock;
+  wakeLock = null;
+  lock.release().catch(() => {});
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    clearTimeout(idlePauseTimer);
+    if (wakeLockWanted) requestWakeLock();
+    if (controlToken && ws?.readyState === WebSocket.OPEN) connectControl(controlToken);
+    resumeViewer();
+  } else {
+    clearTimeout(idlePauseTimer);
+    setStatus('paused', 'wait');
+    idlePauseTimer = setTimeout(() => {
+      if (document.visibilityState !== 'visible' && ws?.readyState === WebSocket.OPEN) {
+        try { ws.close(1000, 'paused'); } catch (e) {}
+      }
+    }, 3000);
+  }
+});
+window.addEventListener('online', () => {
+  if (manualDisconnect) return;
+  clearTimeout(reconnectTimer);
+  setStatus('resuming…', 'wait');
+  if (controlToken && ws?.readyState === WebSocket.OPEN) connectControl(controlToken);
+  resumeViewer();
+});
+window.addEventListener('offline', () => {
+  if (manualDisconnect) return;
+  clearTimeout(reconnectTimer);
+  setStatus('offline', 'wait');
+  if (ws?.readyState === WebSocket.OPEN) {
+    try { ws.close(1000, 'offline'); } catch (e) {}
+  }
+});
+window.addEventListener('pageshow', event => {
+  if (event.persisted && !manualDisconnect) resumeViewer();
+});
+window.addEventListener('pagehide', event => {
+  if (!event.persisted || manualDisconnect) return;
+  clearTimeout(reconnectTimer);
+  clearTimeout(idlePauseTimer);
+  if (ws?.readyState === WebSocket.OPEN) {
+    try { ws.close(1000, 'page cached'); } catch (e) {}
+  }
+});
+['pointerdown', 'keydown', 'touchstart'].forEach(eventName => {
+  window.addEventListener(eventName, () => {
+    if (wakeLockWanted && !wakeLock) requestWakeLock();
+  }, { passive: true });
+});
 
 // ---------------- coordinate mapping ----------------
 function normXY(clientX, clientY) {
@@ -184,6 +932,47 @@ const norm = e => normXY(e.clientX, e.clientY);
 // trackpad: DRAG moves it relatively (re-grippable), HOLD-still jumps it to that spot.
 let curX = 0.5, curY = 0.5;
 const HOLD_MS = 1400;
+const MOVE_SEND_MS = 33;
+let pendingMove = null, moveFlushTimer = 0, lastMoveSentAt = 0;
+
+function queueMove(x, y) {
+  if (!beginPointerAction()) return false;
+  curX = clamp01(x);
+  curY = clamp01(y);
+  setRemoteCursor(curX, curY, true);
+  pendingMove = { x: curX, y: curY };
+  scheduleMoveFlush();
+  return true;
+}
+
+function scheduleMoveFlush() {
+  if (moveFlushTimer) return;
+  const wait = Math.max(0, MOVE_SEND_MS - (performance.now() - lastMoveSentAt));
+  moveFlushTimer = setTimeout(flushPendingMove, wait);
+}
+
+function flushPendingMove() {
+  if (moveFlushTimer) {
+    clearTimeout(moveFlushTimer);
+    moveFlushTimer = 0;
+  }
+  if (!pendingMove) return;
+  const move = pendingMove;
+  pendingMove = null;
+  lastMoveSentAt = performance.now();
+  sendPointerMove(move.x, move.y);
+}
+
+function sendPointerMove(x, y) {
+  const socket = controlSocket();
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  const packet = new ArrayBuffer(5);
+  const view = new DataView(packet);
+  view.setUint8(0, BinaryMessageType.PointerMove);
+  view.setUint16(1, Math.round(clamp01(x) * 65535), true);
+  view.setUint16(3, Math.round(clamp01(y) * 65535), true);
+  socket.send(packet);
+}
 
 // Block the browser's own pinch/zoom of the page (iOS ignores user-scalable=no),
 // so two-finger gestures drive only our canvas zoom.
@@ -192,72 +981,138 @@ const HOLD_MS = 1400;
 
 // ---------------- mouse input (desktop) ----------------
 const BTN = ['left', 'middle', 'right'];
-cv.addEventListener('mousemove', e => { const n = norm(e); curX = n.x; curY = n.y; send({ t: 'move', x: n.x, y: n.y }); });
-cv.addEventListener('mousedown', e => send({ t: 'btn', b: BTN[e.button] || 'left', d: true }));
-cv.addEventListener('mouseup',   e => send({ t: 'btn', b: BTN[e.button] || 'left', d: false }));
+cv.addEventListener('mousemove', e => {
+  const n = norm(e);
+  queueMove(n.x, n.y);
+});
+cv.addEventListener('mousedown', e => {
+  const n = norm(e);
+  if (!queueMove(n.x, n.y)) return;
+  flushPendingMove();
+  send({ t: 'btn', b: BTN[e.button] || 'left', d: true });
+});
+cv.addEventListener('mouseup', e => {
+  const n = norm(e);
+  queueMove(n.x, n.y);
+  flushPendingMove();
+  send({ t: 'btn', b: BTN[e.button] || 'left', d: false });
+});
 cv.addEventListener('contextmenu', e => e.preventDefault());
-cv.addEventListener('wheel', e => { e.preventDefault(); send({ t: 'scroll', delta: e.deltaY > 0 ? -1 : 1 }); }, { passive: false });
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (!beginPointerAction()) return;
+  flushPendingMove();
+  send({ t: 'scroll', delta: e.deltaY > 0 ? -1 : 1 });
+}, { passive: false });
 
 // ---------------- touch input (trackpad model) ----------------
 // 1 finger: DRAG moves the cursor relatively — lift and re-place your finger anywhere
 // to keep going, like a laptop trackpad, so you can reach the whole screen. HOLD still
 // ~1.4s jumps the cursor to that spot. Clicks come from the pad. 2 fingers = pinch-zoom
 // + pan. Double-tap = fit.
-let twoFinger = null, multiTouch = false, lastTapT = 0, lastTapX = 0, lastTapY = 0;
+let twoFinger = null, lastTapT = 0, lastTapX = 0, lastTapY = 0;
 let drag = null, holdTimer = 0;
 const dist = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
-const clamp01 = v => Math.min(1, Math.max(0, v));
+const touchById = (touches, id) => {
+  for (let i = 0; i < touches.length; i++)
+    if (touches[i].identifier === id) return touches[i];
+  return null;
+};
+
+function anchorDrag(touch, moved) {
+  drag = {
+    id: touch.identifier,
+    x: touch.clientX,
+    y: touch.clientY,
+    sx: touch.clientX,
+    sy: touch.clientY,
+    moved,
+  };
+}
+
+function beginPinch(touches) {
+  if (touches.length < 2) return;
+  const a = touches[0], b = touches[1];
+  const r = stage.getBoundingClientRect();
+  twoFinger = {
+    a: a.identifier,
+    b: b.identifier,
+    d: dist(a, b),
+    cx: (a.clientX + b.clientX) / 2 - r.left,
+    cy: (a.clientY + b.clientY) / 2 - r.top,
+  };
+  drag = null;
+  lastTapT = 0;
+  clearTimeout(holdTimer);
+}
+
+function trackedPinchTouches(touches) {
+  if (!twoFinger) return null;
+  const a = touchById(touches, twoFinger.a);
+  const b = touchById(touches, twoFinger.b);
+  return a && b ? { a, b } : null;
+}
 
 cv.addEventListener('touchstart', e => {
   e.preventDefault();
-  if (e.touches.length === 1 && !multiTouch) {
+  if (e.touches.length === 1) {
     const t = e.touches[0], now = performance.now();
     if (now - lastTapT < 300 && Math.hypot(t.clientX - lastTapX, t.clientY - lastTapY) < 30) {
       fitView(); lastTapT = 0; drag = null; clearTimeout(holdTimer); return;   // double-tap → fit
     }
     lastTapT = now; lastTapX = t.clientX; lastTapY = t.clientY;
     // Begin a possible drag/hold WITHOUT moving the cursor (so re-gripping doesn't jump it).
-    drag = { x: t.clientX, y: t.clientY, sx: t.clientX, sy: t.clientY, moved: false };
+    anchorDrag(t, false);
+    const dragId = t.identifier;
     clearTimeout(holdTimer);
     holdTimer = setTimeout(() => {
-      if (drag && !drag.moved) {                  // held still → jump cursor to the poke
+      if (drag && drag.id === dragId && !drag.moved) { // held still → jump cursor to the poke
         const r = cv.getBoundingClientRect();
-        curX = clamp01((drag.sx - r.left) / r.width);
-        curY = clamp01((drag.sy - r.top) / r.height);
-        send({ t: 'move', x: curX, y: curY });
+        if (!queueMove((drag.sx - r.left) / r.width, (drag.sy - r.top) / r.height)) return;
+        flushPendingMove();
         drag.moved = true;                         // further motion continues relatively
       }
     }, HOLD_MS);
-  } else if (e.touches.length === 2) {
-    multiTouch = true; drag = null; clearTimeout(holdTimer);
-    const r = stage.getBoundingClientRect();
-    twoFinger = {
-      d: dist(e.touches[0], e.touches[1]),
-      cx: (e.touches[0].clientX + e.touches[1].clientX) / 2 - r.left,
-      cy: (e.touches[0].clientY + e.touches[1].clientY) / 2 - r.top,
-    };
+  } else if (e.touches.length > 1) {
+    // Commit the last one-finger position before switching gesture modes. The
+    // remaining finger can become a fresh relative-drag anchor when zoom ends.
+    if (!twoFinger) flushPendingMove();
+    if (!trackedPinchTouches(e.touches)) beginPinch(e.touches);
   }
 }, { passive: false });
 
 cv.addEventListener('touchmove', e => {
   e.preventDefault();
-  if (e.touches.length === 1 && !twoFinger && !multiTouch && drag) {
-    const t = e.touches[0];
+  if (e.touches.length === 1) {
+    let t = drag ? touchById(e.touches, drag.id) : null;
+    if (!t) {
+      // A browser may replace a touch identifier during a gesture interruption.
+      // Re-anchor rather than applying a large delta from the previous finger.
+      t = e.touches[0];
+      anchorDrag(t, true);
+      return;
+    }
     if (!drag.moved && Math.hypot(t.clientX - drag.sx, t.clientY - drag.sy) > 8) {
       drag.moved = true; clearTimeout(holdTimer);  // moved = relative drag; cancel teleport
     }
     if (drag.moved) {
       const r = cv.getBoundingClientRect();        // r.width tracks zoom, so motion scales right
-      curX = clamp01(curX + (t.clientX - drag.x) / r.width);
-      curY = clamp01(curY + (t.clientY - drag.y) / r.height);
-      send({ t: 'move', x: curX, y: curY });
+      queueMove(curX + (t.clientX - drag.x) / r.width, curY + (t.clientY - drag.y) / r.height);
     }
     drag.x = t.clientX; drag.y = t.clientY;
-  } else if (e.touches.length === 2 && twoFinger) {
+  } else if (e.touches.length > 1) {
+    const pair = trackedPinchTouches(e.touches);
+    if (!pair) {
+      // One tracked pinch finger disappeared while at least two touches remain.
+      // Select a new stable pair and use this event only as its baseline.
+      beginPinch(e.touches);
+      return;
+    }
+    const { a, b } = pair;
     const r = stage.getBoundingClientRect();
-    const nd = dist(e.touches[0], e.touches[1]);
-    const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2 - r.left;
-    const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2 - r.top;
+    const nd = dist(a, b);
+    const cx = (a.clientX + b.clientX) / 2 - r.left;
+    const cy = (a.clientY + b.clientY) / 2 - r.top;
     // dead-zone: ignore tiny distance changes so a two-finger PAN doesn't drift-zoom
     const ratio = Math.abs(nd - twoFinger.d) > 3 ? nd / twoFinger.d : 1;
     const newScale = Math.max(minScale, Math.min(minScale * 8, scale * ratio));
@@ -271,13 +1126,30 @@ cv.addEventListener('touchmove', e => {
   }
 }, { passive: false });
 
-// Stop zoom/pan when a finger lifts, but keep state until ALL fingers are up.
-cv.addEventListener('touchend', e => {
+function touchSetChanged(e) {
   e.preventDefault();
-  if (e.touches.length < 2) twoFinger = null;
-  if (e.touches.length === 0) { multiTouch = false; drag = null; clearTimeout(holdTimer); }
-}, { passive: false });
-cv.addEventListener('touchcancel', () => { twoFinger = null; multiTouch = false; drag = null; clearTimeout(holdTimer); });
+  if (e.touches.length > 1) {
+    if (!trackedPinchTouches(e.touches)) beginPinch(e.touches);
+    return;
+  }
+
+  if (e.touches.length === 1) {
+    // Any 2+ -> 1 transition resumes relative control with the actual remaining
+    // touch, regardless of which finger or TouchList index survived.
+    twoFinger = null;
+    clearTimeout(holdTimer);
+    anchorDrag(e.touches[0], true);
+    return;
+  }
+
+  flushPendingMove();
+  twoFinger = null;
+  drag = null;
+  clearTimeout(holdTimer);
+}
+
+cv.addEventListener('touchend', touchSetChanged, { passive: false });
+cv.addEventListener('touchcancel', touchSetChanged, { passive: false });
 
 // ---------------- floating control pad ----------------
 const pad = document.getElementById('pad');
@@ -286,8 +1158,18 @@ const padBtn = document.getElementById('padBtn');
 // Hold-to-press buttons: down on press, up on release → tap = click, hold = button held
 // (hold L, then drag the screen with another finger = click-drag).
 function bindButton(el, button) {
-  const down = e => { e.preventDefault(); send({ t: 'btn', b: button, d: true }); };
-  const up   = e => { e.preventDefault(); send({ t: 'btn', b: button, d: false }); };
+  const down = e => {
+    e.preventDefault();
+    if (!beginPointerAction()) return;
+    flushPendingMove();
+    send({ t: 'btn', b: button, d: true });
+  };
+  const up = e => {
+    e.preventDefault();
+    beginPointerAction();
+    flushPendingMove();
+    send({ t: 'btn', b: button, d: false });
+  };
   el.addEventListener('touchstart', down, { passive: false });
   el.addEventListener('touchend', up, { passive: false });
   el.addEventListener('touchcancel', () => send({ t: 'btn', b: button, d: false }));
@@ -303,6 +1185,9 @@ bindButton(document.getElementById('btnR'), 'right');
 const holdBtn = document.getElementById('btnHold');
 let leftLatched = false;
 function toggleHold() {
+  if (!leftLatched && !beginPointerAction()) return;
+  if (leftLatched) beginPointerAction();
+  flushPendingMove();
   leftLatched = !leftLatched;
   send({ t: 'btn', b: 'left', d: leftLatched });
   holdBtn.classList.toggle('on', leftLatched);
@@ -318,7 +1203,13 @@ scrollPad.addEventListener('touchstart', e => { e.preventDefault(); scrollLastY 
 scrollPad.addEventListener('touchmove', e => {
   e.preventDefault();
   const y = e.touches[0].clientY, dY = y - scrollLastY;
-  if (Math.abs(dY) > 8) { send({ t: 'scroll', delta: dY > 0 ? -1 : 1 }); scrollLastY = y; }
+  if (Math.abs(dY) > 8) {
+    if (beginPointerAction()) {
+      flushPendingMove();
+      send({ t: 'scroll', delta: dY > 0 ? -1 : 1 });
+    }
+    scrollLastY = y;
+  }
 }, { passive: false });
 scrollPad.addEventListener('touchend', e => { e.preventDefault(); scrollLastY = null; }, { passive: false });
 
@@ -501,9 +1392,9 @@ function toggleKeyboard() {
 
 // ---------------- misc ----------------
 function toggleSettings() { document.getElementById('panel').classList.toggle('open'); }
-function setFpsBtn(v) {
-  send({ t: 'fps', v });
-  document.querySelectorAll('#panel .seg button').forEach(b => b.classList.toggle('on', +b.dataset.fps === v));
+function setFpsBtn(v, manual = true) {
+  if (manual) adaptiveEnabled = false;
+  applyStreamSettings(v, streamQuality);
 }
 
 // ---------------- send file to PC ----------------
@@ -536,7 +1427,17 @@ async function doUpload(action) {
   pendingFile = null; fileInput.value = '';
 }
 
-function logout() { try { ws && ws.close(); } catch (e) {} fetch('/api/logout', { method: 'POST' }).finally(() => location.href = '/login.html'); }
+function logout() {
+  manualDisconnect = true;
+  clearTimeout(reconnectTimer);
+  clearTimeout(idlePauseTimer);
+  stopNetworkPing();
+  releaseWakeLock();
+  resetVideoRenderer();
+  closeControlChannel(true);
+  try { ws && ws.close(); } catch (e) {}
+  fetch('/api/logout', { method: 'POST' }).finally(() => location.href = '/login.html');
+}
 function fs() { const el = document.documentElement; (el.requestFullscreen || el.webkitRequestFullscreen || (()=>{})).call(el); }
 function sendCAD() { send({ t: 'combo', mods: [17, 18], key: 46 }); }
 
@@ -638,11 +1539,17 @@ window.addEventListener('resize', () => {
 // ---------------- start ----------------
 async function start() {
   setStatus('connecting…', 'wait');
+  manualDisconnect = false;
   try {
     const r = await fetch('/api/session', { cache: 'no-store' });
-    if (r.status !== 200) { location.href = '/login.html'; return; }
+    if (r.status === 401 || r.status === 403) { location.href = '/login.html'; return; }
+    if (!r.ok) throw new Error(`Session check failed (${r.status})`);
     applySessionInfo(await r.json());
-  } catch (e) { location.href = '/login.html'; return; }
+  } catch (e) {
+    setStatus(navigator.onLine === false ? 'offline' : 'reconnecting…', 'wait');
+    scheduleReconnect();
+    return;
+  }
   connect();
 }
 start();

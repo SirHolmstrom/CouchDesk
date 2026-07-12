@@ -1,6 +1,6 @@
 @echo off
 setlocal
-title RemoteDesktopLAN launcher
+title CouchDesk launcher
 cd /d "%~dp0"
 
 REM --- Require the .NET 8 SDK ---
@@ -15,7 +15,7 @@ if errorlevel 1 (
 )
 
 echo ============================================================
-echo  RemoteDesktopLAN - starting tray utility in Release
+echo  CouchDesk - starting tray utility in Release
 echo  First run will restore packages and build (may take a bit).
 echo  Use the notification-area icon to control the server and quit.
 echo ============================================================

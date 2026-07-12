@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using Vortice.MediaFoundation;
@@ -35,6 +36,7 @@ public sealed class H264LowLatencyEncoder : IVideoEncoder
     private static readonly Guid MF_TRANSFORM_ASYNC_UNLOCK  = new("e5666d6b-3422-4eb6-a421-da7db1f8e207");
     private static readonly Guid MFT_CATEGORY_VIDEO_ENCODER = new("f79eac7d-e545-4387-bdee-d647d7bde42a");
     private static readonly Guid IID_IMFTransform           = new("bf94c121-5b05-4e6f-8000-ba598961414d");
+    private static readonly Guid IID_ICodecAPI              = new("901db4c7-31ce-41a2-85dc-8fa0bf41b8da");
     private static readonly Guid CODECAPI_AVLowLatencyMode              = new("9c27891a-ed7a-4e1b-8c3b-7d9dfc5e80c0");
     private static readonly Guid CODECAPI_AVEncCommonRateControlMode    = new("1c0608e9-370c-4710-8a58-cb6181c42423");
     private static readonly Guid CODECAPI_AVEncCommonMeanBitRate        = new("f7222374-2144-4815-b550-a37f8e12ee52");
@@ -47,29 +49,50 @@ public sealed class H264LowLatencyEncoder : IVideoEncoder
     private const uint eAVEncH264VProfile_Main      = 77;
 
     private readonly int m_Width, m_Height, m_Fps, m_Stride;
+    private readonly int m_OutputPrefixBytes;
     private readonly long m_FrameDurationTicks;
     private readonly byte[] m_Nv12;
     private IMFTransform m_Encoder = null!;
+    private IMFAttributes m_EncoderAttributes = null!;
     private IMFMediaEventGenerator m_Events = null!;
+    private IntPtr m_CodecApi;
     private readonly BlockingCollection<IMFSample> m_Input = new(boundedCapacity: 3);
     private readonly Thread m_Pump;
     private volatile bool m_Running = true;
+    private int m_BitrateBitsPerSec;
 
     /// <summary>Raised on the pump thread for each encoded Annex-B access unit.</summary>
     public event Action<EncodedVideoFrame>? FrameEncoded;
 
-    public H264LowLatencyEncoder(int width, int height, int fps, int bitrateBitsPerSec)
+    public H264LowLatencyEncoder(
+        int width,
+        int height,
+        int fps,
+        int bitrateBitsPerSec,
+        int outputPrefixBytes = 0)
     {
         m_Width = width; m_Height = height; m_Fps = fps; m_Stride = width;
+        m_OutputPrefixBytes = Math.Max(0, outputPrefixBytes);
         m_FrameDurationTicks = TimeSpan.FromSeconds(1.0 / fps).Ticks;
         m_Nv12 = new byte[width * height * 3 / 2];
+        m_BitrateBitsPerSec = bitrateBitsPerSec;
 
         MediaFactory.MFStartup();
         m_Encoder = CreateHardwareEncoder();
+        m_CodecApi = QueryCodecApi(m_Encoder);
 
         // Unlock the async interface so we can drive it with the event model.
-        IMFAttributes attrs = m_Encoder.Attributes;
-        attrs.SetUInt32(MF_TRANSFORM_ASYNC_UNLOCK, 1);
+        m_EncoderAttributes = m_Encoder.Attributes;
+        m_EncoderAttributes.SetUInt32(MF_TRANSFORM_ASYNC_UNLOCK, 1);
+
+        // Codec settings belong on ICodecAPI, not on the transform's general attribute
+        // collection. Set static properties before the media types; runtime bitrate
+        // changes use the same interface later.
+        SetInitialCodecValue(CODECAPI_AVLowLatencyMode, 1);
+        SetInitialCodecValue(CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+        SetInitialCodecValue(CODECAPI_AVEncCommonRateControlMode, 0); // CBR
+        SetInitialCodecValue(CODECAPI_AVEncCommonMeanBitRate, (uint)bitrateBitsPerSec);
+        SetInitialCodecValue(CODECAPI_AVEncMPVGOPSize, (uint)(fps * 12));
 
         // Output type MUST be set before input on an encoder.
         IMFMediaType outType = MediaFactory.MFCreateMediaType();
@@ -92,18 +115,6 @@ public sealed class H264LowLatencyEncoder : IVideoEncoder
         inType.SetUInt64(MF_MT_FRAME_RATE, Pack(fps, 1));
         inType.SetUInt64(MF_MT_PIXEL_ASPECT_RATIO, Pack(1, 1));
         m_Encoder.SetInputType(0, inType, 0);
-
-        // Low-latency codec config: real-time, no B-frames, CBR, infrequent key frames
-        // (4s GOP) so per-frame delivery isn't punctuated by big full-frame resends.
-        try
-        {
-            attrs.SetUInt32(CODECAPI_AVLowLatencyMode, 1);
-            attrs.SetUInt32(CODECAPI_AVEncMPVDefaultBPictureCount, 0);
-            attrs.SetUInt32(CODECAPI_AVEncCommonRateControlMode, 0); // CBR
-            attrs.SetUInt32(CODECAPI_AVEncCommonMeanBitRate, (uint)bitrateBitsPerSec);
-            attrs.SetUInt32(CODECAPI_AVEncMPVGOPSize, (uint)(fps * 4));
-        }
-        catch { /* not all encoders expose every property */ }
 
         m_Events = m_Encoder.QueryInterface<IMFMediaEventGenerator>();
         m_Encoder.ProcessMessage(TMessageType.MessageNotifyBeginStreaming, UIntPtr.Zero);
@@ -128,11 +139,61 @@ public sealed class H264LowLatencyEncoder : IVideoEncoder
 
         using var activate = new IMFActivate(ptrs[0]);
         for (int i = 1; i < count; i++) Marshal.Release(ptrs[i]); // keep only the first
-        activate.ActivateObject(out IMFTransform transform);
-        return transform;
+        activate.ActivateObject(out IMFTransform? transform);
+        return transform
+            ?? throw new NotSupportedException("The hardware H.264 encoder could not be activated.");
     }
 
     private static ulong Pack(int a, int b) => ((ulong)(uint)a << 32) | (uint)b;
+
+    private static IntPtr QueryCodecApi(IMFTransform encoder)
+    {
+        Guid iid = IID_ICodecAPI;
+        int result = Marshal.QueryInterface(encoder.NativePointer, ref iid, out IntPtr codecApi);
+        return result >= 0 ? codecApi : IntPtr.Zero;
+    }
+
+    private void SetInitialCodecValue(Guid property, uint value)
+    {
+        if (TrySetCodecUInt32(property, value)) return;
+        try { m_EncoderAttributes.SetUInt32(property, value); }
+        catch { /* vendor does not expose this optional property */ }
+    }
+
+    private unsafe bool TrySetCodecUInt32(Guid property, uint value)
+    {
+        if (m_CodecApi == IntPtr.Zero) return false;
+
+        // ICodecAPI::SetValue is vtable slot 9 after IUnknown and the six preceding
+        // codec methods. CODECAPI_AVEncCommonMeanBitRate requires VARIANT VT_UI4.
+        IntPtr vtable = Marshal.ReadIntPtr(m_CodecApi);
+        IntPtr address = Marshal.ReadIntPtr(vtable, 9 * IntPtr.Size);
+        var setValue = (delegate* unmanaged[Stdcall]<IntPtr, Guid*, NativeVariant*, int>)address;
+        NativeVariant variant = NativeVariant.FromUInt32(value);
+        int result = setValue(m_CodecApi, &property, &variant);
+        return result == 0; // S_OK; S_FALSE means the property is read-only
+    }
+
+    /// <summary>
+    /// Best-effort live bitrate update through the hardware encoder's CodecAPI
+    /// attributes. Most current Intel, AMD, and NVIDIA MFTs apply this without a restart.
+    /// </summary>
+    public bool TrySetBitrate(int bitrateBitsPerSec)
+    {
+        int target = Math.Clamp(bitrateBitsPerSec, 500_000, 100_000_000);
+        if (Volatile.Read(ref m_BitrateBitsPerSec) == target) return true;
+        try
+        {
+            if (!TrySetCodecUInt32(CODECAPI_AVEncCommonMeanBitRate, (uint)target))
+                return false;
+            Volatile.Write(ref m_BitrateBitsPerSec, target);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     public void Encode(ReadOnlySpan<byte> bgra, TimeSpan timestamp, bool forceKeyframe)
     {
@@ -201,12 +262,43 @@ public sealed class H264LowLatencyEncoder : IVideoEncoder
 
             IMFMediaBuffer contig = sample.ConvertToContiguousBuffer();
             contig.Lock(out IntPtr p, out _, out int len);
-            var data = new byte[len];
-            Marshal.Copy(p, data, 0, len);
-            contig.Unlock();
-            contig.Dispose();
+            byte[]? data = null;
+            try
+            {
+                data = ArrayPool<byte>.Shared.Rent(m_OutputPrefixBytes + len);
+                Marshal.Copy(p, data, m_OutputPrefixBytes, len);
+            }
+            catch
+            {
+                if (data is not null) ArrayPool<byte>.Shared.Return(data);
+                throw;
+            }
+            finally
+            {
+                contig.Unlock();
+                contig.Dispose();
+            }
 
-            FrameEncoded?.Invoke(new EncodedVideoFrame(data, key, TimeSpan.FromTicks(ts)));
+            var frame = new EncodedVideoFrame(
+                data,
+                m_OutputPrefixBytes,
+                len,
+                key,
+                TimeSpan.FromTicks(ts));
+            var handler = FrameEncoded;
+            if (handler is null)
+            {
+                frame.Dispose();
+            }
+            else
+            {
+                try { handler(frame); }
+                catch
+                {
+                    frame.Dispose();
+                    throw;
+                }
+            }
         }
         finally { sample.Dispose(); }
     }
@@ -254,8 +346,29 @@ public sealed class H264LowLatencyEncoder : IVideoEncoder
         try { m_Input.CompleteAdding(); } catch { }
         try { m_Pump.Join(500); } catch { }
         try { m_Encoder?.ProcessMessage(TMessageType.MessageNotifyEndStreaming, UIntPtr.Zero); } catch { }
+        if (m_CodecApi != IntPtr.Zero)
+        {
+            try { Marshal.Release(m_CodecApi); } catch { }
+            m_CodecApi = IntPtr.Zero;
+        }
+        try { m_EncoderAttributes?.Dispose(); } catch { }
         try { m_Encoder?.Dispose(); } catch { }
         try { MediaFactory.MFShutdown(); } catch { }
         try { m_Input.Dispose(); } catch { }
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 16)]
+    private struct NativeVariant
+    {
+        private const ushort VariantTypeUInt32 = 19;
+
+        [FieldOffset(0)] private ushort m_Type;
+        [FieldOffset(8)] private uint m_UInt32;
+
+        public static NativeVariant FromUInt32(uint value) => new()
+        {
+            m_Type = VariantTypeUInt32,
+            m_UInt32 = value
+        };
     }
 }

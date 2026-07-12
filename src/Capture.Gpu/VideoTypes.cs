@@ -1,4 +1,16 @@
+using System.Buffers;
+
 namespace Capture.Gpu;
+
+/// <summary>
+/// Allocation-free timings for one DXGI desktop capture attempt. Acquire can include
+/// waiting for the next desktop update; Map is the GPU-to-CPU synchronization point.
+/// </summary>
+public readonly record struct DesktopCaptureTiming(
+    long AcquireTicks,
+    long CopyTicks,
+    long MapTicks,
+    long CpuCopyTicks);
 
 /// <summary>
 /// A captured desktop frame. For this spike the pixels are copied to a managed BGRA
@@ -43,7 +55,41 @@ public interface IGpuFrameSource : IDisposable
 /// produce these; see the "Productionizing" section of PROTOTYPE.md for wiring the Annex B
 /// path into StreamSession as a new binary frame type.
 /// </summary>
-public sealed record EncodedVideoFrame(byte[] AnnexB, bool IsKeyframe, TimeSpan Timestamp);
+public sealed class EncodedVideoFrame : IDisposable
+{
+    private byte[]? m_Buffer;
+
+    public EncodedVideoFrame(
+        byte[] buffer,
+        int payloadOffset,
+        int payloadLength,
+        bool isKeyframe,
+        TimeSpan timestamp)
+    {
+        m_Buffer = buffer;
+        PayloadOffset = payloadOffset;
+        PayloadLength = payloadLength;
+        IsKeyframe = isKeyframe;
+        Timestamp = timestamp;
+    }
+
+    /// <summary>
+    /// Pooled buffer containing optional caller-owned prefix space followed by Annex B.
+    /// The consumer owns this frame and must dispose it after sending or dropping it.
+    /// </summary>
+    public byte[] Buffer => m_Buffer ?? throw new ObjectDisposedException(nameof(EncodedVideoFrame));
+    public int PayloadOffset { get; }
+    public int PayloadLength { get; }
+    public int MessageLength => PayloadOffset + PayloadLength;
+    public bool IsKeyframe { get; }
+    public TimeSpan Timestamp { get; }
+
+    public void Dispose()
+    {
+        byte[]? buffer = Interlocked.Exchange(ref m_Buffer, null);
+        if (buffer is not null) ArrayPool<byte>.Shared.Return(buffer);
+    }
+}
 
 /// <summary>Hardware H.264 encoder.</summary>
 public interface IVideoEncoder : IDisposable

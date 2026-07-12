@@ -20,7 +20,7 @@ public static class Certificates
     // PersistKeySet -> key persists in a real container Schannel/Kestrel can read for
     //                  the handshake (EphemeralKeySet does NOT survive into Kestrel).
     // Cost: each load drops a small key-container file under the user profile.
-    // Negligible here; delete %LOCALAPPDATA%\RemoteDesktopLAN\certs to reset.
+    // Negligible here; delete the CouchDesk app-data certs folder to reset.
     private const X509KeyStorageFlags StorageFlags =
         X509KeyStorageFlags.UserKeySet | X509KeyStorageFlags.PersistKeySet;
 

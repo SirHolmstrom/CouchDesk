@@ -3,51 +3,81 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>Desktop — Remote Desktop LAN</title>
+<link rel="icon" href="favicon.ico">
+<title>CouchDesk | Desktop</title>
 <style>
-  :root { --bar:#16181d; --bar2:#1f232b; --line:#2c313b; --txt:#e7eaf0; --muted:#8a93a3; --accent:#3b82f6; --danger:#dc2626; }
-  html, body { margin:0; height:100%; width:100%; background:#000; color:var(--txt);
-    font-family:system-ui,-apple-system,sans-serif; overflow:hidden; position:fixed;
+  :root { --bg:#0C0C0D; --bar:#18171A; --bar2:#232227; --line:#3A383E; --txt:#FFFAF5; --muted:#A9A29C;
+    --accent:#FF7A1A; --accent-hover:#FF8F3D; --accent-ink:#211006; --danger:#C93636; }
+  html, body { margin:0; height:100%; width:100%; background:var(--bg); color:var(--txt);
+    font-family:"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif; overflow:hidden; position:fixed;
     overscroll-behavior:none; touch-action:none; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
   body { display:flex; flex-direction:column; }
   #stage { flex:1 1 auto; min-height:0; position:relative; overflow:hidden; background:#000; }
-  #screen { position:absolute; top:0; left:0; transform-origin:0 0; touch-action:none; display:block; }
+  #screen { position:absolute; top:0; left:0; transform-origin:0 0; touch-action:none; display:block; cursor:none; }
+  #remoteCursor { position:absolute; left:0; top:0; z-index:70; width:18px; height:26px; pointer-events:none;
+    transform:translate3d(-9999px,-9999px,0); filter:drop-shadow(0 2px 3px rgba(0,0,0,.75)); will-change:transform; }
+  #remoteCursor.smooth { transition:transform 140ms linear; }
+  #remoteCursor.hidden { display:none; }
+  #remoteCursor svg { display:block; overflow:visible; }
 
   /* gear toggle (top-left) with a status dot */
   #gear { position:fixed; top:10px; left:10px; z-index:60; width:46px; height:46px; border-radius:12px;
-    border:1px solid var(--line); background:rgba(22,24,29,.88); color:var(--txt); font-size:20px;
+    border:1px solid var(--line); background:rgba(24,26,30,.92); color:var(--txt); font-size:20px;
     backdrop-filter:blur(6px); display:flex; align-items:center; justify-content:center; position:relative; }
   #gear { position:fixed; }
   .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); display:inline-block; flex:0 0 auto; }
   .dot.ok { background:#22c55e; } .dot.wait { background:#eab308; } .dot.bad { background:#ef4444; }
-  #gear .dot { position:absolute; top:7px; right:7px; box-shadow:0 0 0 2px rgba(22,24,29,.9); }
+  #gear .dot { position:absolute; top:7px; right:7px; box-shadow:0 0 0 2px rgba(24,24,26,.9); }
 
   /* settings panel (unfolds from the gear) */
-  #panel { position:fixed; top:64px; left:10px; z-index:55; width:230px; display:none; flex-direction:column; gap:9px;
-    max-height:calc(100dvh - 80px); overflow-y:auto;
-    padding:11px; background:rgba(22,24,29,.94); border:1px solid var(--line); border-radius:14px; backdrop-filter:blur(8px); }
+  #panel { position:fixed; top:64px; left:10px; z-index:55; width:min(310px, calc(100vw - 20px)); box-sizing:border-box;
+    display:none; flex-direction:column; gap:12px; max-height:calc(100dvh - 76px); overflow-y:auto; overscroll-behavior:contain;
+    padding:12px; background:rgba(24,24,26,.96); border:1px solid var(--line); border-radius:14px;
+    box-shadow:0 14px 38px rgba(0,0,0,.32); backdrop-filter:blur(10px); }
   #panel.open { display:flex; }
-  #panel .row { display:flex; align-items:center; gap:8px; }
-  #panel .row.btns { gap:7px; }
-  #panel .actions { flex-wrap:wrap; }
-  #panel .actions button { flex:1 1 96px; min-width:96px; }
-  #panel .lbl { font-size:12px; color:var(--muted); width:54px; flex:0 0 auto; }
-  #panel #stat { font-size:13px; flex:1 1 auto; }
+  #panel .panel-head { display:grid; grid-template-columns:auto minmax(0,1fr) auto; grid-template-areas:"dot status latency" "dot role latency";
+    align-items:center; column-gap:8px; min-height:30px; padding:1px 2px 10px; border-bottom:1px solid rgba(255,255,255,.08); }
+  #panel .panel-head .dot { grid-area:dot; }
+  #panel #stat { grid-area:status; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; font-weight:600; }
+  #panel #sessionRole { grid-area:role; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #panel #lat { grid-area:latency; min-width:54px; text-align:right; }
+  #panel .section { display:flex; flex-direction:column; gap:9px; }
+  #panel .section-title { font-size:10px; line-height:1; color:var(--muted); text-transform:uppercase; letter-spacing:.09em; }
+  #panel .row { display:grid; grid-template-columns:58px minmax(0,1fr); align-items:center; gap:8px; min-height:32px; }
+  #panel .actions { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:7px; }
+  #panel .actions button { min-width:0; }
+  #panel .lbl { font-size:12px; color:var(--muted); }
   #panel #lat { font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; }
-  #panel select { flex:1 1 auto; font-size:13px; padding:7px; border-radius:7px; background:var(--bar2); color:var(--txt); border:1px solid var(--line); }
-  #panel input[type=range] { flex:1 1 auto; accent-color:var(--accent); }
-  #panel button { flex:1 1 auto; padding:9px 8px; font-size:13px; border-radius:8px; border:1px solid var(--line); background:var(--bar2); color:var(--txt); }
+  #panel select { width:100%; min-width:0; font-size:13px; padding:7px; border-radius:7px; background:var(--bar2); color:var(--txt); border:1px solid var(--line); }
+  #panel input[type=range] { width:100%; min-width:0; accent-color:var(--accent); }
+  #panel button { min-width:0; padding:9px 8px; font-size:13px; border-radius:8px; border:1px solid var(--line); background:var(--bar2); color:var(--txt); }
   #panel button:active { background:#2a2f3a; }
-  #panel button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #panel button.on { background:#2b2e33; border-color:var(--accent); color:var(--txt); box-shadow:inset 0 -2px 0 var(--accent); }
   #panel button.danger { background:var(--danger); border-color:var(--danger); color:#fff; }
-  #panel .seg { display:flex; gap:5px; flex:1 1 auto; }
+  #panel .seg { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:5px; }
   #panel .seg button { padding:7px 0; }
-  #panel .help { font-size:11px; color:var(--muted); line-height:1.5; }
+  #panel .auto-row { grid-template-columns:58px 70px minmax(0,1fr); }
+  #autoStat { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:right; font-size:12px; color:var(--muted); }
+  #panel .health-card { display:grid; grid-template-columns:1.35fr 1fr .8fr 1fr; overflow:hidden;
+    border:1px solid rgba(255,255,255,.09); border-radius:10px; background:rgba(255,255,255,.025); }
+  #panel .metric { min-width:0; padding:8px 7px; border-left:1px solid rgba(255,255,255,.07); }
+  #panel .metric:first-child { border-left:0; }
+  #panel .metric-label { display:block; margin-bottom:3px; color:var(--muted); font-size:9px; line-height:1; text-transform:uppercase; letter-spacing:.06em; }
+  #panel .metric-value { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; line-height:1.2;
+    font-weight:600; font-variant-numeric:tabular-nums; }
+  #healthState.good { color:#4ade80; } #healthState.ok { color:#facc15; } #healthState.busy { color:#fb7185; }
+  #panel .perf-stat { min-height:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    color:var(--muted); font-size:10px; line-height:14px; font-variant-numeric:tabular-nums; }
+  #panel .perf-stat.warn { color:#facc15; }
+  #panel .help { padding-top:1px; font-size:11px; color:var(--muted); line-height:1.45; }
   .permission-hidden { display:none !important; }
   #sessionRole { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; }
-  /* landscape: widen the panel so the action buttons pack 4-5 per row instead of
-     running off the bottom (and the scroll fallback above catches anything left) */
-  @media (orientation: landscape) { #panel { width:min(92vw, 560px); } }
+  @media (orientation:landscape) and (max-height:500px) {
+    #panel { top:58px; max-height:calc(100dvh - 66px); gap:9px; }
+    #panel .panel-head { padding-bottom:7px; }
+    #panel .section { gap:6px; }
+    #panel .row { min-height:29px; }
+  }
 
   /* custom on-screen keyboard — semi-transparent so the desktop shows through */
   #vkbd { position:fixed; left:0; right:0; bottom:0; z-index:55; display:none; flex-direction:column;
@@ -56,39 +86,39 @@
   #vkbd .krow { display:flex; gap:4px; justify-content:center; }
   #vkbd .key { flex:1 1 0; min-width:0; height:42px; border-radius:7px; border:1px solid rgba(255,255,255,.14);
     background:rgba(40,44,52,.62); color:#fff; font-size:15px; display:flex; align-items:center; justify-content:center; }
-  #vkbd .key:active { background:rgba(59,130,246,.92); }
-  #vkbd .key.down { background:var(--accent); border-color:var(--accent); transform:translateY(1px); filter:brightness(1.15); }
+  #vkbd .key:active { background:rgba(255,122,26,.92); color:var(--accent-ink); }
+  #vkbd .key.down { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); transform:translateY(1px); filter:brightness(1.08); }
   #vkbd .key.wide { flex:1.5 1 0; font-size:13px; }
   #vkbd .key.space { flex:4 1 0; }
-  #vkbd .key.armed { background:var(--accent); border-color:var(--accent); }
+  #vkbd .key.armed { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
   /* echo display: mirrors what you type so it's visible above the keys */
-  #echoWrap { position:relative; }
+  #echoWrap { display:flex; flex-direction:column; }
   #kbdEcho { height:60px; overflow-y:auto; font-size:15px; line-height:1.4; padding:8px; border-radius:8px;
     border:1px solid rgba(255,255,255,.22); background:rgba(12,13,16,.92); color:#fff; white-space:pre-wrap; word-break:break-word; }
   #kbdEcho:empty::before { content:'what you type shows here'; color:var(--muted); }
-  #echoBtns { position:absolute; top:5px; right:5px; display:flex; gap:5px; }
-  #echoBtns button { padding:3px 9px; font-size:11px; border-radius:6px;
+  #echoBtns { display:flex; gap:5px; justify-content:flex-end; }
+  #echoBtns button { padding:5px 10px; font-size:11px; border-radius:6px;
     border:1px solid rgba(255,255,255,.2); background:rgba(40,44,52,.92); color:#cfd6e2; }
   #vkeys { display:flex; flex-direction:column; gap:4px; }
 
   /* floating mouse-button pad (default top-right, draggable by its grip) */
   #pad { position:fixed; top:64px; right:12px; z-index:50; display:flex; flex-direction:column; gap:6px;
-    padding:6px; background:rgba(22,24,29,.88); border:1px solid var(--line); border-radius:14px; backdrop-filter:blur(6px); touch-action:none; }
+    padding:6px; background:rgba(24,24,26,.9); border:1px solid var(--line); border-radius:14px; backdrop-filter:blur(6px); touch-action:none; }
   #pad.hidden { display:none; }
   #pad .grip { height:20px; display:flex; align-items:center; justify-content:center; color:var(--muted); cursor:move; font-size:14px; letter-spacing:3px; }
   #pad button { width:54px; height:46px; border-radius:10px; border:1px solid var(--line); background:var(--bar2); color:var(--txt); font-size:15px; font-weight:600; }
-  #pad button:active { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #pad button:active { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
   #pad .scroll { width:54px; height:70px; border-radius:10px; border:1px dashed var(--line); background:var(--bar2); color:var(--muted);
     font-size:11px; display:flex; flex-direction:column; align-items:center; justify-content:center; line-height:1.4; touch-action:none; }
 
   /* floating system-keys pad (Ctrl+Alt+Del / PrtScn), draggable, starts under the gear */
   #syskeys { position:fixed; top:64px; left:10px; z-index:50; display:flex; flex-direction:column; gap:6px;
-    padding:6px; background:rgba(22,24,29,.88); border:1px solid var(--line); border-radius:14px; backdrop-filter:blur(6px); touch-action:none; }
+    padding:6px; background:rgba(24,24,26,.9); border:1px solid var(--line); border-radius:14px; backdrop-filter:blur(6px); touch-action:none; }
   #syskeys.hidden { display:none; }
   #syskeys .grip { height:18px; display:flex; align-items:center; justify-content:center; color:var(--muted); cursor:move; font-size:14px; letter-spacing:3px; }
   #syskeys .skgrid { display:grid; grid-template-columns:repeat(1, 58px); gap:6px; }
   #syskeys button { height:38px; padding:0; border-radius:9px; border:1px solid var(--line); background:var(--bar2); color:var(--txt); font-size:12px; font-weight:600; }
-  #syskeys button:active, #syskeys button.held { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #syskeys button:active, #syskeys button.held { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
   /* landscape: lay the keys out wide so the panel isn't taller than the screen */
   @media (orientation: landscape) { #syskeys .skgrid { grid-template-columns:repeat(4, 58px); } }
 
@@ -97,12 +127,12 @@
 
   /* floating arrow-keys panel (optional, toggle from settings), draggable */
   #arrows { position:fixed; top:300px; left:10px; z-index:50; display:flex; flex-direction:column; gap:6px;
-    padding:6px; background:rgba(22,24,29,.88); border:1px solid var(--line); border-radius:14px; backdrop-filter:blur(6px); touch-action:none; }
+    padding:6px; background:rgba(24,24,26,.9); border:1px solid var(--line); border-radius:14px; backdrop-filter:blur(6px); touch-action:none; }
   #arrows.hidden { display:none; }
   #arrows .grip { height:18px; display:flex; align-items:center; justify-content:center; color:var(--muted); cursor:move; font-size:14px; letter-spacing:3px; }
   #arrows .arrgrid { display:grid; grid-template-columns:repeat(3, 46px); gap:6px; }
   #arrows button { height:44px; border-radius:10px; border:1px solid var(--line); background:var(--bar2); color:var(--txt); font-size:18px; font-weight:600; }
-  #arrows button:active, #arrows button.down { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #arrows button:active, #arrows button.down { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
 
   /* file upload chooser */
   #upload { position:fixed; inset:0; z-index:80; display:none; align-items:center; justify-content:center; background:rgba(0,0,0,.55); }
@@ -113,7 +143,7 @@
   #upload .name { font-size:13px; color:var(--muted); word-break:break-all; }
   #upload .sub { font-size:12px; color:var(--muted); margin-top:4px; }
   #upload button { padding:11px; font-size:14px; border-radius:9px; border:1px solid var(--line); background:var(--bar2); color:var(--txt); }
-  #upload button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  #upload button.primary { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); font-weight:700; }
   #upload button.cancel { background:transparent; color:var(--muted); }
   #upload .status { font-size:13px; min-height:18px; color:#34d399; }
 </style>
@@ -121,44 +151,63 @@
 <body>
   <button id="gear" onclick="toggleSettings()"><span id="dot" class="dot wait"></span>⚙</button>
   <div id="panel">
-    <div class="row"><span id="dot2" class="dot wait"></span><span id="stat">connecting…</span><span id="sessionRole"></span><span id="lat">— ms</span></div>
-    <div class="row"><span class="lbl">Monitor</span><select id="mon" onchange="setMonitor()"></select></div>
-    <div class="row"><span class="lbl">Quality</span><input id="q" type="range" min="10" max="95" value="70" onchange="setQuality()"></div>
-    <div class="row"><span class="lbl">FPS</span>
-      <span class="seg">
-        <button data-fps="10" onclick="setFpsBtn(10)">10</button>
-        <button data-fps="20" class="on" onclick="setFpsBtn(20)">20</button>
-        <button data-fps="30" onclick="setFpsBtn(30)">30</button>
-      </span>
+    <div class="panel-head">
+      <span id="dot2" class="dot wait"></span><span id="stat">connecting…</span><span id="sessionRole"></span><span id="lat">-- ms</span>
     </div>
-    <div class="row btns actions">
-      <button onclick="fs()">⛶ Full</button>
-      <button id="kbdBtn" data-requires="control" onclick="toggleKeyboard()">⌨ Keys</button>
-      <button id="padBtn" data-requires="control" onclick="toggleControls()">✋ Pad</button>
-      <button onclick="resetZoom()">⤢ Fit</button>
-      <button id="sysBtn" data-requires="system" onclick="toggleSysKeys()">⌃ Sys keys</button>
-      <button id="arrBtn" data-requires="control" onclick="toggleArrows()">⇅ Arrows</button>
-      <button id="fileBtn" data-requires="files" onclick="pickFile()">📤 Send file</button>
-      <button class="danger" onclick="logout()">⏻ Disconnect</button>
+    <div class="section">
+      <div class="section-title">Display</div>
+      <div class="row"><span class="lbl">Monitor</span><select id="mon" onchange="setMonitor()"></select></div>
+      <div class="row"><span class="lbl">Quality</span><input id="q" type="range" min="10" max="95" value="70" onchange="setQuality()"></div>
+      <div class="row"><span class="lbl">FPS</span>
+        <span class="seg">
+          <button data-fps="10" onclick="setFpsBtn(10)">10</button>
+          <button data-fps="20" class="on" onclick="setFpsBtn(20)">20</button>
+          <button data-fps="30" onclick="setFpsBtn(30)">30</button>
+        </span>
+      </div>
+      <div class="row auto-row"><span class="lbl">Stream</span><button id="autoBtn" class="on" onclick="toggleAdaptive()">Auto</button><span id="autoStat">stable</span></div>
     </div>
-    <div class="help">drag = move cursor (lift &amp; re-place to keep going) · hold ≈1.4s = jump cursor there · pad L/R = click · Hold = pin-drag · 2 fingers = zoom &amp; pan · double-tap = fit</div>
+    <div class="section">
+      <div class="section-title">Connection</div>
+      <div class="health-card" aria-label="Connection health">
+        <div class="metric"><span class="metric-label">Health</span><span id="healthState" class="metric-value">waiting</span></div>
+        <div class="metric"><span class="metric-label">Control</span><span id="healthLatency" class="metric-value">-- ms</span></div>
+        <div class="metric"><span class="metric-label">Queue</span><span id="healthQueue" class="metric-value">0</span></div>
+        <div class="metric"><span class="metric-label">Codec</span><span id="healthCodec" class="metric-value">H.264</span></div>
+      </div>
+      <div id="perfStat" class="perf-stat" title="Peak host processing times">Peak: collecting diagnostics…</div>
+    </div>
+    <div class="section">
+      <div class="section-title">Tools</div>
+      <div class="actions">
+        <button onclick="fs()">⛶ Full</button>
+        <button id="kbdBtn" data-requires="control" onclick="toggleKeyboard()">⌨ Keys</button>
+        <button id="padBtn" data-requires="control" onclick="toggleControls()">✋ Pad</button>
+        <button onclick="resetZoom()">⤢ Fit</button>
+        <button id="sysBtn" data-requires="system" onclick="toggleSysKeys()">⌃ Sys keys</button>
+        <button id="arrBtn" data-requires="control" onclick="toggleArrows()">⇅ Arrows</button>
+        <button id="fileBtn" data-requires="files" onclick="pickFile()">📤 Send file</button>
+        <button class="danger" onclick="logout()">⏻ Disconnect</button>
+      </div>
+    </div>
+    <div class="help">Tip: two fingers zoom and pan. Double-tap fits.</div>
   </div>
 
   <div id="vkbd" data-requires="control">
+    <div id="echoBtns">
+      <button onclick="send({t:'getFocusText'})" title="Pull the PC field's current text">sync</button>
+      <button onclick="clearEcho()">clear</button>
+      <button onclick="toggleKeyboard()">hide</button>
+    </div>
     <div id="echoWrap">
       <div id="kbdEcho"></div>
-      <div id="echoBtns">
-        <button onclick="send({t:'getFocusText'})" title="Pull the PC field's current text">⟳ sync</button>
-        <button onclick="clearEcho()">clear</button>
-        <button onclick="toggleKeyboard()">⌄ hide</button>
-      </div>
     </div>
     <div id="vkeys"></div>
   </div>
 
   <div id="pad" data-requires="control">
     <div class="grip" id="padGrip">⠿⠿</div>
-    <button id="btnL" title="Left click — tap to click, hold while dragging the screen to click-drag">L</button>
+    <button id="btnL" title="Left click. Tap to click, or hold while dragging the screen to click-drag.">L</button>
     <div class="scroll" id="scrollPad">▲<br>scroll<br>▼</div>
     <button id="btnR" title="Right click">R</button>
     <button id="btnHold" title="Pin the left button down, drag one finger to move/select, tap again to drop">Hold</button>
@@ -186,13 +235,21 @@
     </div>
   </div>
 
-  <div id="stage"><canvas id="screen"></canvas></div>
+  <div id="stage">
+    <canvas id="screen"></canvas>
+    <div id="remoteCursor" class="hidden" aria-hidden="true">
+      <svg viewBox="0 0 18 26" width="18" height="26">
+        <path d="M2 2 L2 20 L7 15 L11 25 L15 23 L11 14 L17 14 Z" fill="#fff" stroke="#000" stroke-width="2.5" stroke-linejoin="round"></path>
+        <path d="M2 2 L2 20 L7 15 L11 25 L15 23 L11 14 L17 14 Z" fill="#fff" stroke="#FF7A1A" stroke-width="1" stroke-linejoin="round"></path>
+      </svg>
+    </div>
+  </div>
 
   <input id="fileInput" data-requires="files" type="file" style="display:none">
   <div id="upload" data-requires="files">
     <div class="box">
       <div class="title">Send to PC</div>
-      <div id="uploadName" class="name">—</div>
+      <div id="uploadName" class="name">None</div>
       <div class="sub">After it arrives on the PC:</div>
       <button class="primary" onclick="doUpload('store')">Store in folder</button>
       <button onclick="doUpload('open')">Store &amp; open folder</button>

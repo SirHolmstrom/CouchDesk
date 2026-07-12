@@ -1,4 +1,4 @@
-// Remote Desktop LAN — hardware-video renderer (MediaSource / fragmented MP4).
+// CouchDesk hardware-video renderer (MediaSource / fragmented MP4).
 //
 // The CLIENT half of the UseHardwareVideo path. The server captures on the GPU, hardware-
 // encodes H.264, and streams a fragmented MP4 over the WebSocket (binary messages tagged
@@ -130,6 +130,7 @@
 
     return {
       get supported() { return supported; },
+      get pending() { return pending.length + (sourceBuffer && sourceBuffer.updating ? 1 : 0); },
 
       appendChunk(bytes) {
         if (closed) return;

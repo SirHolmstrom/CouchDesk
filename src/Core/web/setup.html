@@ -3,36 +3,56 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>First-run setup — Remote Desktop LAN</title>
+<link rel="icon" href="favicon.ico">
+<title>CouchDesk | Setup</title>
 <style>
-  :root { --bar:#16181d; --bar2:#1f232b; --line:#2c313b; --txt:#e7eaf0; --muted:#8a93a3; --accent:#3b82f6; }
+  :root { --bg:#FBFAF8; --card:#FFFFFF; --field:#F4F1EC; --line:#E7E2DC; --txt:#1A1512;
+    --muted:#7C7269; --accent:#FF7A1A; --accent-hover:#F06A00; --accent-ink:#2A1508;
+    --soft:#F1EDE8; --label:#4A413A; --foot:#A79E94; --err:#C4381F; --ok:#1E8A5B;
+    --card-shadow:0 20px 50px rgba(120,80,30,.12); }
+  :root[data-theme="dark"] { --bg:#0C0C0D; --card:#18171A; --field:#232227; --line:#3A383E; --txt:#FFFAF5;
+    --muted:#A9A29C; --accent:#FF7A1A; --accent-hover:#FF8F3D; --accent-ink:#211006;
+    --soft:#111317; --label:#C7CBD1; --foot:#777E87; --err:#F87171; --ok:#34D399;
+    --card-shadow:0 18px 50px rgba(0,0,0,.32); }
   * { box-sizing: border-box; }
   html, body { margin:0; height:100%; }
-  body { background:#000; color:var(--txt); font-family:system-ui,-apple-system,sans-serif;
+  body { background:var(--bg); color:var(--txt); font-family:"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
     display:flex; align-items:center; justify-content:center; padding:20px; }
-  .card { width:100%; max-width:380px; background:var(--bar); border:1px solid var(--line);
-    border-radius:16px; padding:28px 24px; }
-  .brand { display:flex; align-items:center; gap:10px; margin-bottom:16px; }
-  .brand .dot { width:10px; height:10px; border-radius:50%; background:var(--accent); box-shadow:0 0 12px var(--accent); }
-  .brand h1 { font-size:18px; font-weight:600; margin:0; }
-  p.sub { color:var(--muted); font-size:13px; line-height:1.5; margin:0 0 6px; }
-  label { display:block; font-size:12px; color:var(--muted); margin:12px 0 6px; }
-  input { width:100%; font-size:16px; padding:12px; border-radius:10px; background:var(--bar2);
+  .card { width:100%; max-width:420px; background:var(--card); border:1px solid var(--line);
+    border-radius:14px; padding:32px; box-shadow:var(--card-shadow); }
+  .brand { display:flex; align-items:center; gap:10px; margin-bottom:28px; }
+  .brand img { width:30px; height:30px; border-radius:8px; }
+  .brand strong { font-size:15px; font-weight:600; letter-spacing:.01em; }
+  h1 { font-size:24px; line-height:1.25; font-weight:600; letter-spacing:-.02em; margin:0 0 8px; }
+  p.sub { color:var(--muted); font-size:13px; line-height:1.55; margin:0 0 20px; }
+  label { display:block; font-size:12px; font-weight:600; color:var(--label); margin:14px 0 7px; }
+  input { width:100%; font-size:15px; padding:12px 13px; border-radius:9px; background:var(--field);
     color:var(--txt); border:1px solid var(--line); outline:none; }
-  input:focus { border-color:var(--accent); }
-  button { width:100%; font-size:15px; font-weight:600; padding:12px; margin-top:16px; border-radius:10px;
-    background:var(--accent); color:#fff; border:none; cursor:pointer; }
-  button:active { filter:brightness(.92); }
+  input:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(255,122,26,.14); }
+  button { width:100%; font-size:14px; font-weight:600; padding:12px; margin-top:18px; border-radius:9px;
+    background:var(--accent); color:var(--accent-ink); border:none; cursor:pointer; }
+  button:hover { background:var(--accent-hover); }
+  button:active { transform:translateY(1px); }
   #msg { margin-top:12px; min-height:18px; font-size:13px; color:var(--muted); }
-  #msg.err { color:#f87171; }
-  #msg.ok { color:#34d399; }
-  .hint { font-size:11px; color:var(--muted); margin-top:14px; text-align:center; }
+  #msg.err { color:var(--err); }
+  #msg.ok { color:var(--ok); }
+  .hint { font-size:11px; color:var(--foot); margin-top:16px; text-align:center; }
+  .theme-toggle { position:fixed; top:14px; right:14px; width:38px; height:38px; margin:0; padding:0;
+    display:flex; align-items:center; justify-content:center; font-size:16px; border-radius:10px;
+    background:var(--card); color:var(--muted); border:1px solid var(--line); box-shadow:var(--card-shadow); cursor:pointer; }
+  .theme-toggle:hover { background:var(--soft); }
+  @media (max-width:460px) { .card { padding:26px 22px; } }
 </style>
+<script>(function(){try{var t=localStorage.getItem('cd-theme')||'light';if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');}}catch(e){}})();</script>
 </head>
 <body>
+  <button class="theme-toggle" type="button" onclick="toggleTheme()" aria-label="Toggle light/dark"><span id="themeIcon">☾</span></button>
   <div class="card">
-    <div class="brand"><span class="dot"></span><h1>Remote Desktop LAN</h1></div>
-    <p class="sub">First-run setup. Choose a strong password — at least 12 characters. It's stored only as an Argon2id hash; the plaintext is never written to disk.</p>
+    <div class="brand"><img src="favicon.ico" alt=""><strong>CouchDesk</strong></div>
+    <h1 id="title">Secure this PC</h1>
+    <p class="sub">Choose a strong password with at least 12 characters. CouchDesk stores only an Argon2id hash, never the plaintext password.</p>
+    <label for="hostName">This PC name</label>
+    <input id="hostName" type="text" placeholder="Mattias PC" autocomplete="off" maxlength="64">
     <label for="p">Admin password</label>
     <input id="p" type="password" placeholder="At least 12 characters" autocomplete="new-password">
     <label for="p2">Confirm password</label>
@@ -44,10 +64,38 @@
   </div>
 
 <script>
+function toggleTheme(){
+  const d=document.documentElement;
+  const dark=d.getAttribute('data-theme')==='dark';
+  if(dark){d.removeAttribute('data-theme');} else {d.setAttribute('data-theme','dark');}
+  try{localStorage.setItem('cd-theme',dark?'light':'dark');}catch(e){}
+  updateThemeIcon();
+}
+function updateThemeIcon(){
+  const dark=document.documentElement.getAttribute('data-theme')==='dark';
+  const el=document.getElementById('themeIcon');
+  if(el) el.textContent=dark?'☀':'☾';
+}
+updateThemeIcon();
+loadHostName();
+
+async function loadHostName() {
+  try {
+    const r = await fetch('/api/about', { cache: 'no-store' });
+    if (!r.ok) return;
+    const about = await r.json();
+    const name = String(about.hostDisplayName || '').trim();
+    if (!name) return;
+    document.getElementById('title').textContent = 'Secure ' + name;
+    document.getElementById('hostName').value = name;
+  } catch (e) {}
+}
+
 async function go() {
   const msg = document.getElementById('msg');
   const p = document.getElementById('p').value;
   const p2 = document.getElementById('p2').value;
+  const hostDisplayName = document.getElementById('hostName').value.trim();
   msg.className = '';
 
   if (p.length < 12) { msg.textContent = 'Password must be at least 12 characters.'; msg.className = 'err'; return; }
@@ -57,7 +105,7 @@ async function go() {
     const r = await fetch('/api/setup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: p })
+      body: JSON.stringify({ password: p, hostDisplayName })
     });
     if (r.ok) {
       msg.textContent = 'Done. Redirecting to login…';

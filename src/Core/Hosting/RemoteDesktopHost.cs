@@ -1,5 +1,8 @@
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net;
 using System.Text.Json;
+using Core.Branding;
 using Core.Capture;
 using Core.Config;
 using Core.Files;
@@ -16,6 +19,7 @@ public sealed class RemoteDesktopHost : IAsyncDisposable
 {
     private const int MaxSessions = 4;
     private const string CookieName = "rd_session";
+    private static readonly JsonSerializerOptions WebJsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly AppConfig m_Config;
     private readonly NetworkInfoService m_Network;
@@ -23,7 +27,9 @@ public sealed class RemoteDesktopHost : IAsyncDisposable
     private readonly SessionStore m_Sessions;
     private readonly LoginThrottle m_Throttle = new();
     private readonly StreamSessionRegistry m_Registry = new();
+    private readonly PointerInputArbiter m_PointerInput = new();
     private readonly GdiScreenCapturer m_Capturer = new();
+    private readonly ConcurrentDictionary<string, long> m_LastSpikeLogAt = new();
     private WebApplication? m_App;
 
     public string LanUrl => $"https://{LanIp}:{Port}";
@@ -34,6 +40,7 @@ public sealed class RemoteDesktopHost : IAsyncDisposable
     public StreamSessionRegistry Sessions => m_Registry;
     public SessionStore LoginSessions => m_Sessions;
     public GuestInviteStore GuestInvites => m_GuestInvites;
+    public PointerInputArbiter PointerInput => m_PointerInput;
 
     public RemoteDesktopHost(AppConfig config, NetworkInfoService network)
     {
@@ -144,6 +151,14 @@ public sealed class RemoteDesktopHost : IAsyncDisposable
                 Path = "/"
             });
 
+        app.MapGet("/api/about", context =>
+            context.Response.WriteAsJsonAsync(new
+            {
+                productName = ProductInfo.Name,
+                hostDisplayName = HostDisplayName.Get(m_Config),
+                isConfigured = m_Config.IsConfigured
+            }));
+
         app.MapGet("/setup", async context =>
         {
             if (m_Config.IsConfigured)
@@ -173,6 +188,8 @@ public sealed class RemoteDesktopHost : IAsyncDisposable
             }
 
             m_Config.PasswordHash = PasswordHasher.Hash(password);
+            m_Config.HostDisplayName = HostDisplayName.NormalizeCustom(
+                body?.GetValueOrDefault("hostDisplayName"));
             m_Config.BindAddress = LanIp.ToString();
             m_Config.Save();
             AuditLogger.Log("SETUP_COMPLETE", ClientIp(context));
@@ -261,6 +278,94 @@ public sealed class RemoteDesktopHost : IAsyncDisposable
             });
         });
 
+        // A lightweight RTT probe on a separate HTTP connection. Unlike the WebSocket
+        // pong, this response cannot sit behind a large outbound video frame.
+        app.MapGet("/api/ping", context =>
+        {
+            if (LoginSession(context) is null)
+            {
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                return Task.CompletedTask;
+            }
+
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+            return Task.CompletedTask;
+        });
+
+        app.MapPost("/api/diagnostics/spike", async context =>
+        {
+            if (LoginSession(context) is null)
+            {
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                return;
+            }
+            if (context.Request.ContentLength is > 8192)
+            {
+                context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+                return;
+            }
+
+            StreamSpikeReport? report;
+            try
+            {
+                report = await JsonSerializer.DeserializeAsync<StreamSpikeReport>(
+                    context.Request.Body,
+                    WebJsonOptions,
+                    context.RequestAborted);
+            }
+            catch (JsonException)
+            {
+                context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                return;
+            }
+            if (report is null)
+            {
+                context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                return;
+            }
+
+            string ip = ClientIp(context);
+            long now = Environment.TickCount64;
+            if (m_LastSpikeLogAt.TryGetValue(ip, out long last) && now - last < 5000)
+            {
+                context.Response.StatusCode = StatusCodes.Status204NoContent;
+                return;
+            }
+            m_LastSpikeLogAt[ip] = now;
+
+            string codec = report.Codec?.Equals("jpeg", StringComparison.OrdinalIgnoreCase) == true
+                ? "jpeg"
+                : report.Codec?.Equals("h264", StringComparison.OrdinalIgnoreCase) == true
+                    ? "h264"
+                    : "unknown";
+            AuditLogger.Log(
+                "STREAM_SPIKE",
+                ip,
+                $"controlMs={Metric(report.ControlRttMs)} netMs={Metric(report.NetworkRttMs)} "
+                + $"netAgeMs={Metric(report.NetworkSampleAgeMs)} "
+                + $"capturePeakMs={Metric(report.CapturePeakMs)} "
+                + $"acquirePeakMs={Metric(report.CaptureAcquirePeakMs)} "
+                + $"copyPeakMs={Metric(report.CaptureCopyPeakMs)} mapPeakMs={Metric(report.CaptureMapPeakMs)} "
+                + $"cpuCopyPeakMs={Metric(report.CaptureCpuCopyPeakMs)} encodePeakMs={Metric(report.EncodePeakMs)} "
+                + $"controlSendWaitPeakMs={Metric(report.ControlSendWaitPeakMs)} controlSendPeakMs={Metric(report.ControlSendPeakMs)} "
+                + $"sendWaitPeakMs={Metric(report.SendWaitPeakMs)} sendPeakMs={Metric(report.SendPeakMs)} "
+                + $"hostQueuePeak={Math.Clamp(report.HostQueuePeak, 0, 10000)} "
+                + $"framePeakKb={Metric(report.FramePeakBytes / 1024.0)} "
+                + $"videoKbps={Metric(report.VideoKbps)} targetKbps={Math.Clamp(report.TargetVideoBitrateKbps, 0, 100000)} "
+                + $"appliedKbps={Math.Clamp(report.AppliedVideoBitrateKbps, 0, 100000)} "
+                + $"videoFrames={Math.Clamp(report.VideoFrames, 0, 10000)} paced={(report.PacedFrameSeen ? 1 : 0)} "
+                + $"decoderQueue={Math.Clamp(report.DecoderQueue, 0, 10000)} "
+                + $"paintPeakMs={Metric(report.PaintPeakMs)} paintGapPeakMs={Metric(report.PaintGapPeakMs)} "
+                + $"browserLoopPeakMs={Metric(report.BrowserEventLoopPeakMs)} browserLongTaskPeakMs={Metric(report.BrowserLongTaskPeakMs)} "
+                + $"hostTimerPeakMs={Metric(report.HostTimerPeakMs)} "
+                + $"cpu={Metric(report.ProcessCpuPercent)}/{Metric(report.SystemCpuPercent)} "
+                + $"threadPool={Math.Clamp(report.ThreadPoolQueue, 0, 100000)}/{Math.Clamp(report.ThreadPoolThreads, 0, 10000)} "
+                + $"keyframe={(report.KeyframeSeen ? 1 : 0)} "
+                + $"gc={Math.Clamp(report.Gc0, 0, 10000)}/{Math.Clamp(report.Gc1, 0, 10000)}/{Math.Clamp(report.Gc2, 0, 10000)} "
+                + $"codec={codec} fps={Math.Clamp(report.Fps, 1, 60)}");
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+        });
+
         app.MapPost("/api/upload", async context =>
         {
             var session = LoginSession(context);
@@ -313,8 +418,32 @@ public sealed class RemoteDesktopHost : IAsyncDisposable
             return context.Response.Body.WriteAsync(frame.JpegBytes).AsTask();
         });
 
+        app.MapGet("/ws/control", async context =>
+        {
+            var loginSession = LoginSession(context);
+            string token = context.Request.Query["token"].ToString();
+            if (loginSession is null
+                || (!IsLanClient(context) && !m_Config.RemoteAccessEnabled)
+                || string.IsNullOrWhiteSpace(token)
+                || !m_Registry.TryGetByControlToken(token, out var session)
+                || !session.MatchesLoginSession(loginSession))
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                return;
+            }
+            if (!context.WebSockets.IsWebSocketRequest)
+            {
+                context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                return;
+            }
+
+            using var socket = await context.WebSockets.AcceptWebSocketAsync();
+            await session.RunControlSocketAsync(socket, context.RequestAborted);
+        });
+
         app.MapGet("/ws", async context =>
         {
+            string loginToken = context.Request.Cookies[CookieName] ?? "";
             var loginSession = LoginSession(context);
             if (loginSession is null || (!IsLanClient(context) && !m_Config.RemoteAccessEnabled))
             {
@@ -343,8 +472,11 @@ public sealed class RemoteDesktopHost : IAsyncDisposable
                 ClientIp(context),
                 IsLanClient(context),
                 loginSession,
+                m_PointerInput,
                 () => loginSession.GuestInviteId is not Guid inviteId
                     || m_GuestInvites.IsActive(inviteId),
+                () => m_Sessions.TryGet(loginToken, out _),
+                () => m_Sessions.Revoke(loginToken),
                 context.RequestAborted);
             m_Registry.Add(session);
             try { await session.RunAsync(); }
@@ -402,7 +534,8 @@ public sealed class RemoteDesktopHost : IAsyncDisposable
         {
             if (!m_Config.IsConfigured
                 && !context.Request.Path.StartsWithSegments("/setup")
-                && !context.Request.Path.StartsWithSegments("/api/setup"))
+                && !context.Request.Path.StartsWithSegments("/api/setup")
+                && !context.Request.Path.StartsWithSegments("/api/about"))
             {
                 context.Response.Redirect("/setup");
                 return;
@@ -427,7 +560,16 @@ public sealed class RemoteDesktopHost : IAsyncDisposable
         defaultFiles.DefaultFileNames.Clear();
         defaultFiles.DefaultFileNames.Add("login.html");
         app.UseDefaultFiles(defaultFiles);
-        app.UseStaticFiles(new StaticFileOptions { FileProvider = fileProvider });
+        app.UseStaticFiles(new StaticFileOptions
+        {
+            FileProvider = fileProvider,
+            OnPrepareResponse = context =>
+            {
+                context.Context.Response.Headers.CacheControl = "no-store, no-cache, must-revalidate";
+                context.Context.Response.Headers.Pragma = "no-cache";
+                context.Context.Response.Headers.Expires = "0";
+            }
+        });
     }
 
     private static string GetWebRoot()
@@ -440,6 +582,48 @@ public sealed class RemoteDesktopHost : IAsyncDisposable
 
         throw new DirectoryNotFoundException("The packaged web frontend could not be found.");
     }
+
+    private static string Metric(double value) =>
+        Math.Clamp(double.IsFinite(value) ? value : 0, 0, 60_000)
+            .ToString("0.##", CultureInfo.InvariantCulture);
+
+    private sealed record StreamSpikeReport(
+        double ControlRttMs,
+        double NetworkRttMs,
+        double NetworkSampleAgeMs,
+        double CapturePeakMs,
+        double CaptureAcquirePeakMs,
+        double CaptureCopyPeakMs,
+        double CaptureMapPeakMs,
+        double CaptureCpuCopyPeakMs,
+        double EncodePeakMs,
+        double ControlSendWaitPeakMs,
+        double ControlSendPeakMs,
+        double SendWaitPeakMs,
+        double SendPeakMs,
+        int HostQueuePeak,
+        int FramePeakBytes,
+        double VideoKbps,
+        int VideoFrames,
+        int TargetVideoBitrateKbps,
+        int AppliedVideoBitrateKbps,
+        bool PacedFrameSeen,
+        int DecoderQueue,
+        double PaintPeakMs,
+        double PaintGapPeakMs,
+        double BrowserEventLoopPeakMs,
+        double BrowserLongTaskPeakMs,
+        double HostTimerPeakMs,
+        double ProcessCpuPercent,
+        double SystemCpuPercent,
+        long ThreadPoolQueue,
+        int ThreadPoolThreads,
+        bool KeyframeSeen,
+        int Gc0,
+        int Gc1,
+        int Gc2,
+        string? Codec,
+        int Fps);
 
     public async ValueTask DisposeAsync()
     {

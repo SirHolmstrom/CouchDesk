@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using SharpGen.Runtime;
@@ -32,6 +33,7 @@ public sealed class DesktopDuplicationSource : IGpuFrameSource
 
     public int Width { get; private set; }
     public int Height { get; private set; }
+    public DesktopCaptureTiming LastTiming { get; private set; }
 
     public DesktopDuplicationSource(int outputIndex = 0)
     {
@@ -98,22 +100,29 @@ public sealed class DesktopDuplicationSource : IGpuFrameSource
     {
         if (m_Duplication is null) CreateDuplication();
 
+        long acquireStartedAt = Stopwatch.GetTimestamp();
         Result r = m_Duplication!.AcquireNextFrame(
             timeoutMs, out OutduplFrameInfo _, out IDXGIResource? resource);
+        long acquireTicks = Stopwatch.GetTimestamp() - acquireStartedAt;
 
         // Nothing changed within the timeout — the caller treats this as "idle".
         if (r == Vortice.DXGI.ResultCode.WaitTimeout)
+        {
+            LastTiming = new DesktopCaptureTiming(acquireTicks, 0, 0, 0);
             return null;
+        }
 
         // Access lost: resolution/mode change, fullscreen transition, or the secure
         // (UAC/lock) desktop. Recreate the duplication and report idle for this tick.
         if (r == Vortice.DXGI.ResultCode.AccessLost)
         {
+            LastTiming = new DesktopCaptureTiming(acquireTicks, 0, 0, 0);
             RecreateDuplication();
             return null;
         }
         r.CheckError();
 
+        long copyStartedAt = Stopwatch.GetTimestamp();
         try
         {
             using (resource)
@@ -124,10 +133,14 @@ public sealed class DesktopDuplicationSource : IGpuFrameSource
         {
             m_Duplication.ReleaseFrame();
         }
+        long copyTicks = Stopwatch.GetTimestamp() - copyStartedAt;
 
         // Map the staging texture and copy into a tight, top-down BGRA buffer. RowPitch
         // usually exceeds Width*4 (alignment), so copy row by row.
+        long mapStartedAt = Stopwatch.GetTimestamp();
         MappedSubresource map = m_Context.Map(m_Staging!, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+        long mapTicks = Stopwatch.GetTimestamp() - mapStartedAt;
+        long cpuCopyStartedAt = Stopwatch.GetTimestamp();
         try
         {
             int tight = Width * 4;
@@ -138,6 +151,8 @@ public sealed class DesktopDuplicationSource : IGpuFrameSource
         {
             m_Context.Unmap(m_Staging!, 0);
         }
+        long cpuCopyTicks = Stopwatch.GetTimestamp() - cpuCopyStartedAt;
+        LastTiming = new DesktopCaptureTiming(acquireTicks, copyTicks, mapTicks, cpuCopyTicks);
 
         return new DesktopFrame { Width = Width, Height = Height, Bgra = m_Buffer, Changed = true };
     }

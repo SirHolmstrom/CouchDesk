@@ -67,7 +67,7 @@ internal sealed class CompatibleUpnpRemoteAccessProvider : IRemoteAccessProvider
                 Pair("NewInternalPort", config.Port),
                 Pair("NewInternalClient", m_Network.GetLanIp()),
                 Pair("NewEnabled", 1),
-                Pair("NewPortMappingDescription", "RemoteDesktopLAN"),
+                Pair("NewPortMappingDescription", "CouchDesk"),
                 Pair("NewLeaseDuration", 0)
             };
             await InvokeAsync(

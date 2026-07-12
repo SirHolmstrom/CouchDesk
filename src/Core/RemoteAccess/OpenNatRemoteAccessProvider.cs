@@ -55,7 +55,7 @@ public sealed class OpenNatRemoteAccessProvider : IRemoteAccessProvider
                     }
 
                     var mapping = new Mapping(
-                        Protocol.Tcp, config.Port, config.ExternalPort, "RemoteDesktopLAN");
+                        Protocol.Tcp, config.Port, config.ExternalPort, "CouchDesk");
                     await device.CreatePortMapAsync(mapping);
 
                     m_Device = device;

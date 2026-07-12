@@ -2,13 +2,14 @@
 
 <img width="2560" height="1280" alt="image" src="https://github.com/user-attachments/assets/c2ea8eb0-9a0c-44ca-945b-bd7240354bf0" />
 
-**CouchDesk** : Your Windows PC in a browser tab, run it on your PC, open a browser, and connect. There is no client to install on the other device, not account creation and nothing is relayed through somebody else's servers.
+CouchDesk puts your Windows PC in a browser tab. Run it on the PC, open a browser, and connect. There is no client to install on the other device, no account to create, and nothing is relayed through somebody else's servers.
 
 ## What it does
 
-- Streams your desktop to any modern browser over HTTPS (locally default).
+- Streams your desktop to any modern browser over HTTPS, with LAN-only access by default.
 - Works properly on a phone: trackpad-style mouse, keyboard, scrolling, zoom, and draggable controls.
-- Supports multiple monitors, live quality/FPS controls, and file uploads to the PC.
+- Supports multiple monitors, adaptive stream quality, and file uploads to the PC.
+- Uses low-latency hardware H.264 by default, with automatic JPEG fallback.
 - Runs quietly from the Windows tray instead of keeping a window open.
 - Uses an owner password plus optional temporary guest codes.
 
@@ -17,9 +18,9 @@ The tray is where most things live. Left-click opens the dashboard. Right-click 
 - Open or copy the LAN address.
 - Open or close direct remote access.
 - Generate **Spectator**, **Control**, or **Full Access** guest codes.
-- See and revoke active codes and sessions.
-- Change stream quality and FPS.
-- Change the password, lock sessions, manage startup, open logs, or quit.
+- See and revoke active codes and sessions, with an optional host-only viewer overlay.
+- Change stream quality, FPS, and hardware video mode.
+- Rename the PC, change the password, manage startup, open logs, or quit.
 
 The tray icon also changes when somebody is actively viewing the PC, which is a small thing I ended up really liking.
 
@@ -60,7 +61,7 @@ https://<PC-LAN-IP>:8443
 If Windows Firewall gets in the way, use **Advanced > Add/Repair LAN Firewall Rule** from the tray, or run:
 
 ```bat
-allowRemoteDesktopLAN.bat
+allowCouchDeskLAN.bat
 ```
 
 Another device may show a warning for the self-signed certificate the first time it connects.
@@ -88,7 +89,7 @@ That also means your router and ISP get a vote. CGNAT may make incoming connecti
 
 ## A few honest limitations
 
-- GDI capture is simple and dependable, but high resolutions and FPS can use a fair bit of CPU.
+- Hardware H.264 needs a compatible GPU and browser. CouchDesk falls back to JPEG tiles when it is unavailable.
 - UAC prompts and the Windows lock screen appear black because Windows protects that desktop.
 - Self-signed certificates are awkward on devices that have not trusted them yet.
 - Direct internet access cannot work through every router or ISP setup.
@@ -96,13 +97,15 @@ That also means your router and ISP get a vote. CGNAT may make incoming connecti
 Configuration, certificates, and logs live here:
 
 ```
-%LOCALAPPDATA%\RemoteDesktopLAN\
+%LOCALAPPDATA%\CouchDesk\
 ```
+
+Upgrades from RemoteDesktopLAN keep using the old folder automatically so passwords and certificates are not lost.
 
 Uploaded files land here:
 
 ```
-%USERPROFILE%\Downloads\RemoteDesktopLAN\
+%USERPROFILE%\Downloads\CouchDesk\
 ```
 
 ## License

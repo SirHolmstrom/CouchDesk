@@ -23,23 +23,41 @@ public sealed record ClientView(
 public sealed class StreamSessionRegistry
 {
     private readonly ConcurrentDictionary<string, StreamSession> m_Sessions = new();
+    private readonly ConcurrentDictionary<string, StreamSession> m_ControlTokens = new();
+
+    public event Action<ClientView>? ClientJoined;
 
     public int Count => m_Sessions.Count;
 
-    public void Add(StreamSession session) => m_Sessions[session.Id] = session;
-    public void Remove(string id) => m_Sessions.TryRemove(id, out _);
+    public void Add(StreamSession session)
+    {
+        m_Sessions[session.Id] = session;
+        m_ControlTokens[session.ControlToken] = session;
+        ClientJoined?.Invoke(ToView(session));
+    }
+
+    public void Remove(string id)
+    {
+        if (m_Sessions.TryRemove(id, out var session))
+            m_ControlTokens.TryRemove(session.ControlToken, out _);
+    }
+
+    public bool TryGetByControlToken(string token, out StreamSession session) =>
+        m_ControlTokens.TryGetValue(token, out session!);
 
     public IReadOnlyList<ClientView> Snapshot() => m_Sessions.Values
-        .Select(session => new ClientView(
-            session.Id, session.ClientIp, session.ConnectedUtc, session.Fps, session.Quality, session.Monitor,
-            session.Role, session.GuestAccessLevel, session.GuestInviteId))
+        .Select(ToView)
         .ToList();
+
+    private static ClientView ToView(StreamSession session) => new(
+        session.Id, session.ClientIp, session.ConnectedUtc, session.Fps, session.Quality, session.Monitor,
+        session.Role, session.GuestAccessLevel, session.GuestInviteId);
 
     public bool Disconnect(string id)
     {
         if (m_Sessions.TryGetValue(id, out var session))
         {
-            session.Cancel();
+            session.Kick();
             return true;
         }
         return false;
@@ -48,7 +66,7 @@ public sealed class StreamSessionRegistry
     public void DisconnectAll()
     {
         foreach (var session in m_Sessions.Values)
-            session.Cancel();
+            session.Kick();
     }
 
     public int CountForGuestInvite(Guid inviteId) =>
@@ -57,6 +75,6 @@ public sealed class StreamSessionRegistry
     public void DisconnectGuestInvite(Guid inviteId)
     {
         foreach (var session in m_Sessions.Values.Where(session => session.GuestInviteId == inviteId))
-            session.Cancel();
+            session.Kick();
     }
 }

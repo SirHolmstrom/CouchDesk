@@ -72,7 +72,8 @@ public sealed class GdiScreenCapturer : IScreenCapturer
         EnsureFrameBitmap(monitor.Index, monitor.Width, monitor.Height);
         using (var graphics = Graphics.FromImage(m_FrameBitmap!))
             graphics.CopyFromScreen(monitor.X, monitor.Y, 0, 0, new Size(monitor.Width, monitor.Height));
-        DrawCursor(m_FrameBitmap!, monitor.X, monitor.Y); // CopyFromScreen omits the cursor; composite it in
+        // The cursor is sent as a separate WebSocket overlay. Keeping it out of the
+        // bitmap means cursor movement does not dirty JPEG tiles or video frames.
 
         int cols = (monitor.Width + tileSize - 1) / tileSize;
         int rows = (monitor.Height + tileSize - 1) / tileSize;
@@ -199,35 +200,6 @@ public sealed class GdiScreenCapturer : IScreenCapturer
         m_FrameHeight = height;
     }
 
-    /// <summary>
-    /// Composites the current OS cursor onto the captured bitmap at its screen
-    /// position (relative to the captured monitor). Frees the mask/colour bitmaps
-    /// that GetIconInfo allocates to avoid a GDI handle leak.
-    /// </summary>
-    private void DrawCursor(Bitmap bitmap, int monitorX, int monitorY)
-    {
-        var cursorInfo = new CURSORINFO { cbSize = Marshal.SizeOf<CURSORINFO>() };
-        if (!GetCursorInfo(ref cursorInfo) || (cursorInfo.flags & CURSOR_SHOWING) == 0 || cursorInfo.hCursor == IntPtr.Zero)
-            return;
-
-        int hotspotX = 0, hotspotY = 0;
-        if (GetIconInfo(cursorInfo.hCursor, out var iconInfo))
-        {
-            hotspotX = iconInfo.xHotspot;
-            hotspotY = iconInfo.yHotspot;
-            if (iconInfo.hbmMask != IntPtr.Zero) DeleteObject(iconInfo.hbmMask);
-            if (iconInfo.hbmColor != IntPtr.Zero) DeleteObject(iconInfo.hbmColor);
-        }
-
-        int x = cursorInfo.ptScreenPos.X - monitorX - hotspotX;
-        int y = cursorInfo.ptScreenPos.Y - monitorY - hotspotY;
-
-        using var graphics = Graphics.FromImage(bitmap);
-        IntPtr hdc = graphics.GetHdc();
-        try { DrawIconEx(hdc, x, y, cursorInfo.hCursor, 0, 0, 0, IntPtr.Zero, DI_NORMAL); }
-        finally { graphics.ReleaseHdc(hdc); }
-    }
-
     public void Dispose()
     {
         m_FrameBitmap?.Dispose();
@@ -243,31 +215,6 @@ public sealed class GdiScreenCapturer : IScreenCapturer
 
     [DllImport("user32.dll")]
     private static extern bool GetMonitorInfo(IntPtr hMon, ref MONITORINFO mi);
-
-    [DllImport("user32.dll")]
-    private static extern bool GetCursorInfo(ref CURSORINFO pci);
-
-    [DllImport("user32.dll")]
-    private static extern bool GetIconInfo(IntPtr hIcon, out ICONINFO piconinfo);
-
-    [DllImport("user32.dll")]
-    private static extern bool DrawIconEx(IntPtr hdc, int x, int y, IntPtr hIcon,
-        int w, int h, int istep, IntPtr brush, int flags);
-
-    [DllImport("gdi32.dll")]
-    private static extern bool DeleteObject(IntPtr o);
-
-    private const int CURSOR_SHOWING = 0x0001;
-    private const int DI_NORMAL = 0x0003;
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct POINT { public int X, Y; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct CURSORINFO { public int cbSize; public int flags; public IntPtr hCursor; public POINT ptScreenPos; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct ICONINFO { public bool fIcon; public int xHotspot, yHotspot; public IntPtr hbmMask, hbmColor; }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT { public int left, top, right, bottom; }

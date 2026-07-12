@@ -2,9 +2,11 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using Core.Config;
+using Core.Branding;
 using Core.Hosting;
 using Core.RemoteAccess;
 using Core.Security;
+using Core.Streaming;
 using WinForms = System.Windows.Forms;
 
 namespace Core.Tray;
@@ -27,9 +29,13 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
     private readonly TrayMenuHostForm m_MenuHost = new();
     private readonly WinForms.Timer m_StartupNotificationTimer = new() { Interval = 700 };
     private readonly WinForms.Timer m_ActivityRefreshTimer = new() { Interval = 500 };
+    private readonly WinForms.Timer m_OverlayPreviewTimer = new() { Interval = 5000 };
+    private readonly Dictionary<string, DateTime> m_LastJoinNotificationByClient = new();
 
+    private readonly WinForms.ToolStripMenuItem m_HostNameStatus = new();
     private readonly WinForms.ToolStripMenuItem m_LanStatus = new();
     private readonly WinForms.ToolStripMenuItem m_RemoteStatus = new();
+    private readonly WinForms.ToolStripMenuItem m_ActiveViewers = new("Active Viewers...");
     private readonly WinForms.ToolStripMenuItem m_GuestAccess = new("Guest Access");
     private readonly WinForms.ToolStripMenuItem m_CopyRemoteUrl = new("Copy Remote URL");
     private readonly WinForms.ToolStripMenuItem m_OpenRemote = new("Open Remote Access");
@@ -43,10 +49,15 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
     private readonly WinForms.ToolStripMenuItem m_StartMinimized = new("Start Minimized");
     private readonly WinForms.ToolStripMenuItem m_ShowTaskbarButton = new("Show Taskbar Button");
     private readonly WinForms.ToolStripMenuItem m_HardwareVideo = new("Hardware video (H.264, low latency)");
+    private readonly WinForms.ToolStripMenuItem m_ViewerOverlayEnabled = new("Enabled");
     private readonly Dictionary<int, WinForms.ToolStripMenuItem> m_FpsItems = new();
     private readonly Dictionary<int, WinForms.ToolStripMenuItem> m_QualityItems = new();
     private TaskbarStatusForm? m_TaskbarStatusForm;
     private AccessCodeManagerForm? m_AccessCodeManager;
+    private ActiveViewersForm? m_ActiveViewersForm;
+    private CouchDeskSettingsForm? m_SettingsForm;
+    private ViewerOverlayForm? m_ViewerOverlay;
+    private bool m_OverlayPreviewVisible;
     private bool m_Quitting;
 
     public TrayAppContext(
@@ -63,12 +74,13 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
         m_Firewall = firewall;
 
         BuildMenu();
+        m_Host.Sessions.ClientJoined += OnClientJoined;
         m_Menu.Opening += (_, _) => UpdateMenu();
         m_MenuHost.Show();
         m_NotifyIcon = new WinForms.NotifyIcon
         {
             Icon = GetTrayIcon(),
-            Text = "RemoteDesktopLAN",
+            Text = ProductInfo.Name,
             ContextMenuStrip = m_Menu,
             Visible = true
         };
@@ -89,8 +101,15 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
             ShowStartupNotification();
         };
         m_ActivityRefreshTimer.Tick += (_, _) => RefreshActivityStatus();
+        m_OverlayPreviewTimer.Tick += (_, _) =>
+        {
+            m_OverlayPreviewTimer.Stop();
+            m_OverlayPreviewVisible = false;
+            UpdateViewerOverlay();
+        };
         UpdateMenu();
         SetTaskbarButtonVisible(m_Config.ShowTaskbarButton);
+        UpdateViewerOverlay();
         m_StartupNotificationTimer.Start();
         m_ActivityRefreshTimer.Start();
         if (!m_Config.StartMinimized) OpenUrl(m_Host.LanUrl);
@@ -98,11 +117,12 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
 
     private void BuildMenu()
     {
-        var title = new WinForms.ToolStripMenuItem("RemoteDesktopLAN")
+        var title = new WinForms.ToolStripMenuItem(ProductInfo.Name)
         {
             Enabled = false,
             Font = new System.Drawing.Font(m_Menu.Font, System.Drawing.FontStyle.Bold)
         };
+        m_HostNameStatus.Enabled = false;
         m_LanStatus.Enabled = false;
         m_RemoteStatus.Enabled = false;
 
@@ -110,6 +130,11 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
         openLan.Click += (_, _) => OpenUrl(m_Host.LanUrl);
         var copyLan = new WinForms.ToolStripMenuItem("Copy LAN URL");
         copyLan.Click += (_, _) => CopyText(m_Host.LanUrl);
+        m_ActiveViewers.Click += (_, _) => ShowActiveViewers();
+        var renameHost = new WinForms.ToolStripMenuItem("Rename This PC...");
+        renameHost.Click += (_, _) => RenameHost();
+        var settings = new WinForms.ToolStripMenuItem("Settings...");
+        settings.Click += (_, _) => ShowSettings();
 
         var remoteMenu = new WinForms.ToolStripMenuItem("Remote Access");
         m_OpenRemote.Click += async (_, _) => await SafeAsync(OpenRemoteAsync);
@@ -225,6 +250,19 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
         });
 
         var advanced = new WinForms.ToolStripMenuItem("Advanced");
+        var viewerOverlay = new WinForms.ToolStripMenuItem("Viewer Overlay");
+        m_ViewerOverlayEnabled.Click += (_, _) =>
+        {
+            m_Config.ShowViewerOverlay = !m_Config.ShowViewerOverlay;
+            m_Config.Save();
+            UpdateMenu();
+        };
+        var previewViewerOverlay = new WinForms.ToolStripMenuItem("Preview for 5 seconds");
+        previewViewerOverlay.Click += (_, _) => PreviewViewerOverlay();
+        viewerOverlay.DropDownItems.AddRange(new WinForms.ToolStripItem[]
+        {
+            m_ViewerOverlayEnabled, previewViewerOverlay
+        });
         m_OpenRouter.Click += (_, _) => OpenRouter();
         m_CopyForwarding.Click += (_, _) => CopyForwardingValues();
         var ensureLanFirewall = new WinForms.ToolStripMenuItem("Add/Repair LAN Firewall Rule");
@@ -237,6 +275,7 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
         openConfig.Click += (_, _) => OpenPath(AppPaths.ConfigFolder);
         advanced.DropDownItems.AddRange(new WinForms.ToolStripItem[]
         {
+            viewerOverlay, new WinForms.ToolStripSeparator(),
             m_OpenRouter, m_CopyForwarding, ensureLanFirewall, removeFirewall,
             new WinForms.ToolStripSeparator(), viewLogs, openConfig
         });
@@ -246,11 +285,99 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
 
         m_Menu.Items.AddRange(new WinForms.ToolStripItem[]
         {
-            title, m_LanStatus, m_RemoteStatus,
-            new WinForms.ToolStripSeparator(), openLan, copyLan,
+            title, m_HostNameStatus, m_LanStatus, m_RemoteStatus,
+            new WinForms.ToolStripSeparator(), openLan, copyLan, m_ActiveViewers, renameHost, settings,
             new WinForms.ToolStripSeparator(), remoteMenu, m_GuestAccess, accessMode, streaming, security, startup, advanced,
             new WinForms.ToolStripSeparator(), quit
         });
+    }
+
+    private void RenameHost()
+    {
+        string current = HostDisplayName.Get(m_Config);
+        string? entered = PromptDialogs.ShowText(
+            "Rename This PC",
+            "Shown on the CouchDesk login screen",
+            current,
+            "Leave blank to use the Windows user or PC name automatically.");
+        if (entered is null) return;
+
+        m_Config.HostDisplayName = HostDisplayName.NormalizeCustom(entered);
+        m_Config.Save();
+        UpdateMenu();
+        PromptDialogs.ShowInfo($"This PC is shown as \"{HostDisplayName.Get(m_Config)}\".");
+    }
+
+    private void ShowSettings()
+    {
+        if (m_SettingsForm is null || m_SettingsForm.IsDisposed)
+        {
+            m_SettingsForm = new CouchDeskSettingsForm(
+                m_Config,
+                m_StatusIcons.AppIcon,
+                SetTaskbarButtonVisible,
+                UpdateMenu);
+            m_SettingsForm.FormClosed += (_, _) => m_SettingsForm = null;
+            m_SettingsForm.Show();
+        }
+        else
+        {
+            m_SettingsForm.WindowState = WinForms.FormWindowState.Normal;
+            m_SettingsForm.Activate();
+        }
+    }
+
+    private void OnClientJoined(ClientView client)
+    {
+        if (m_Quitting) return;
+
+        void Notify()
+        {
+            if (m_Quitting || !m_NotifyIcon.Visible) return;
+            UpdateMenu();
+            if (!ShouldShowJoinNotification(client)) return;
+
+            string role = client.Role == SessionRole.Guest
+                ? $"Guest ({client.GuestAccessLevel?.ToString() ?? "Spectator"})"
+                : "Owner";
+            m_NotifyIcon.ShowBalloonTip(
+                5000,
+                "Viewer joined",
+                $"{role} connected from {client.ClientIp}.",
+                WinForms.ToolTipIcon.Info);
+        }
+
+        try
+        {
+            if (m_MenuHost.IsHandleCreated)
+                m_MenuHost.BeginInvoke((Action)Notify);
+            else
+                Notify();
+        }
+        catch
+        {
+            // Notification failed; the stream itself should not care.
+        }
+    }
+
+    private bool ShouldShowJoinNotification(ClientView client)
+    {
+        string key = $"{client.ClientIp}|{client.Role}|{client.GuestAccessLevel}";
+        DateTime now = DateTime.UtcNow;
+        foreach (var stale in m_LastJoinNotificationByClient
+                     .Where(entry => now - entry.Value > TimeSpan.FromMinutes(5))
+                     .Select(entry => entry.Key)
+                     .ToArray())
+        {
+            m_LastJoinNotificationByClient.Remove(stale);
+        }
+
+        if (m_LastJoinNotificationByClient.TryGetValue(key, out var last)
+            && now - last < TimeSpan.FromSeconds(60))
+            return false;
+
+        m_LastJoinNotificationByClient[key] = now;
+        return true;
     }
 
     private async Task OpenRemoteAsync()
@@ -357,6 +484,21 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
         }
     }
 
+    private void ShowActiveViewers()
+    {
+        if (m_ActiveViewersForm is null || m_ActiveViewersForm.IsDisposed)
+        {
+            m_ActiveViewersForm = new ActiveViewersForm(m_Host, ShowAccessCodeManager);
+            m_ActiveViewersForm.FormClosed += (_, _) => m_ActiveViewersForm = null;
+            m_ActiveViewersForm.Show();
+        }
+        else
+        {
+            m_ActiveViewersForm.WindowState = WinForms.FormWindowState.Normal;
+            m_ActiveViewersForm.Activate();
+        }
+    }
+
     private void ChangePassword()
     {
         if (!m_Config.IsConfigured)
@@ -432,7 +574,7 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
 
     private void CopyForwardingValues()
     {
-        string text = $"RemoteDesktopLAN port forwarding:\r\n\r\n" +
+        string text = $"{ProductInfo.Name} port forwarding:\r\n\r\n" +
             $"Protocol: TCP\r\n" +
             $"External port: {m_Config.ExternalPort}\r\n" +
             $"Internal IP: {m_Host.LanIp}\r\n" +
@@ -479,6 +621,7 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
 
     private void UpdateMenu()
     {
+        m_HostNameStatus.Text = $"This PC: {HostDisplayName.Get(m_Config)}";
         m_LanStatus.Text = m_Host.IsRunning
             ? $"LAN Access: Active ({m_Host.LanIp}:{m_Host.Port})"
             : "LAN Access: Stopped";
@@ -509,6 +652,8 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
         int activeInvites = m_Host.GuestInvites.Snapshot().Count(invite => invite.IsActive);
         m_GuestAccess.Text = activeInvites == 0 ? "Guest Access" : $"Guest Access ({activeInvites})";
         m_GuestAccess.Enabled = m_Config.IsConfigured;
+        int sessions = m_Host.Sessions.Count;
+        m_ActiveViewers.Text = sessions == 0 ? "Active Viewers..." : $"Active Viewers ({sessions})...";
 
         m_LanMode.Checked = m_Config.AccessMode == RemoteAccessMode.LanOnly;
         m_AutomaticMode.Checked = m_Config.AccessMode == RemoteAccessMode.Automatic;
@@ -519,11 +664,40 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
         m_StartMinimized.Checked = m_Config.StartMinimized;
         m_ShowTaskbarButton.Checked = m_Config.ShowTaskbarButton;
         m_HardwareVideo.Checked = m_Config.UseHardwareVideo;
+        m_ViewerOverlayEnabled.Checked = m_Config.ShowViewerOverlay;
 
         string? router = m_Config.LastRouterUrl ?? m_Network.GetRouterUrl();
         m_OpenRouter.Enabled = router is not null;
         m_CopyForwarding.Enabled = !m_Host.LanIp.Equals(System.Net.IPAddress.Loopback);
+        UpdateViewerOverlay();
         m_TaskbarStatusForm?.UpdateStatus();
+    }
+
+    private void UpdateViewerOverlay()
+    {
+        if (m_OverlayPreviewVisible) return;
+
+        int sessions = m_Host.Sessions.Count;
+        if (!m_Config.ShowViewerOverlay || sessions == 0)
+        {
+            m_ViewerOverlay?.UpdateViewers(Array.Empty<ClientView>(), m_Host.PointerInput.Snapshot());
+            return;
+        }
+
+        if (m_ViewerOverlay is null || m_ViewerOverlay.IsDisposed)
+            m_ViewerOverlay = new ViewerOverlayForm();
+        m_ViewerOverlay.UpdateViewers(m_Host.Sessions.Snapshot(), m_Host.PointerInput.Snapshot());
+    }
+
+    private void PreviewViewerOverlay()
+    {
+        if (m_ViewerOverlay is null || m_ViewerOverlay.IsDisposed)
+            m_ViewerOverlay = new ViewerOverlayForm();
+
+        m_OverlayPreviewVisible = true;
+        m_ViewerOverlay.ShowPreview();
+        m_OverlayPreviewTimer.Stop();
+        m_OverlayPreviewTimer.Start();
     }
 
     private void SetTaskbarButtonVisible(bool visible)
@@ -583,6 +757,7 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
         var icon = GetTrayIcon();
         if (!ReferenceEquals(m_NotifyIcon.Icon, icon)) m_NotifyIcon.Icon = icon;
         m_NotifyIcon.Text = GetTrayToolTip();
+        UpdateViewerOverlay();
         m_TaskbarStatusForm?.UpdateStatus();
     }
 
@@ -598,17 +773,17 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
         };
         int sessions = m_Host.Sessions.Count;
         string viewers = sessions == 0 ? "no active session" : $"{sessions} active session{(sessions == 1 ? "" : "s")}";
-        return $"RemoteDesktopLAN - LAN {(m_Host.IsRunning ? "active" : "stopped")}, remote {remote}, {viewers}";
+        return $"{ProductInfo.Name} - LAN {(m_Host.IsRunning ? "active" : "stopped")}, remote {remote}, {viewers}";
     }
 
     private void ShowStartupNotification()
     {
         string message = m_Config.IsConfigured
             ? $"LAN access is active at {m_Host.LanUrl}\nLeft-click for the dashboard; right-click for controls."
-            : "RemoteDesktopLAN is running. Left-click the tray icon to finish setup in the LAN dashboard.";
+            : $"{ProductInfo.Name} is running. Left-click the tray icon to finish setup in the LAN dashboard.";
         m_NotifyIcon.ShowBalloonTip(
             5000,
-            "RemoteDesktopLAN started",
+            $"{ProductInfo.Name} started",
             message,
             WinForms.ToolTipIcon.Info);
     }
@@ -644,14 +819,22 @@ public sealed class TrayAppContext : WinForms.ApplicationContext
     {
         if (disposing)
         {
+            m_Host.Sessions.ClientJoined -= OnClientJoined;
             SetTaskbarButtonVisible(false);
+            m_SettingsForm?.Close();
+            m_SettingsForm?.Dispose();
+            m_ViewerOverlay?.Close();
+            m_ViewerOverlay?.Dispose();
             m_AccessCodeManager?.Close();
             m_AccessCodeManager?.Dispose();
+            m_ActiveViewersForm?.Close();
+            m_ActiveViewersForm?.Dispose();
             m_MenuHost.Close();
             m_MenuHost.Dispose();
             m_StartupNotificationTimer.Stop();
             m_StartupNotificationTimer.Dispose();
             m_ActivityRefreshTimer.Stop();
+            m_OverlayPreviewTimer.Stop();
             m_ActivityRefreshTimer.Dispose();
             m_NotifyIcon.Visible = false;
             m_NotifyIcon.Dispose();

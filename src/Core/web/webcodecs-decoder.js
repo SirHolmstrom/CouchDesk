@@ -1,4 +1,4 @@
-// Remote Desktop LAN — WebCodecs H.264 decode path (bandwidth upgrade over the JPEG-tile stream).
+// CouchDesk WebCodecs H.264 decode path (bandwidth upgrade over the JPEG-tile stream).
 //
 // This is the CLIENT half of the hardware-video pipeline. The server captures the
 // desktop on the GPU (DXGI Desktop Duplication) and hardware-encodes H.264; the browser
@@ -19,6 +19,7 @@
 
   const supported = typeof window.VideoDecoder === 'function'
     && typeof window.EncodedVideoChunk === 'function';
+  const MAX_DECODE_QUEUE = 3;
 
   // ---- Annex B helpers -----------------------------------------------------
   // The server sends raw Annex B (NAL units separated by 00 00 01 / 00 00 00 01),
@@ -75,8 +76,17 @@
     let configured = false;
     let waitingForKeyframe = true; // can't decode deltas until an IDR configures us
     let lastW = 0, lastH = 0;
+    let lastPaintAt = 0;
+    let lastPaintMs = 0, peakPaintMs = 0;
+    let lastPaintGapMs = 0, peakPaintGapMs = 0;
 
     function paint(frame) {
+      const startedAt = performance.now();
+      if (lastPaintAt) {
+        lastPaintGapMs = startedAt - lastPaintAt;
+        peakPaintGapMs = Math.max(peakPaintGapMs, lastPaintGapMs);
+      }
+      lastPaintAt = startedAt;
       try {
         const w = frame.displayWidth, h = frame.displayHeight;
         if (w !== lastW || h !== lastH) {
@@ -87,50 +97,84 @@
         ctx.drawImage(frame, 0, 0);
       } finally {
         frame.close(); // VideoFrames hold GPU memory — release promptly or we stall
+        lastPaintMs = performance.now() - startedAt;
+        peakPaintMs = Math.max(peakPaintMs, lastPaintMs);
       }
     }
 
     function buildDecoder() {
-      decoder = new VideoDecoder({
-        output: paint,
+      let instance;
+      instance = new VideoDecoder({
+        output: frame => {
+          if (decoder === instance) paint(frame);
+          else frame.close();
+        },
         error: err => {
+          if (decoder !== instance) return;
           // A decode error means our reference chain is broken; drop back to
           // "need keyframe" and let the caller request one.
           waitingForKeyframe = true;
           configured = false;
-          try { decoder && decoder.state !== 'closed' && decoder.close(); } catch {}
+          try { instance.state !== 'closed' && instance.close(); } catch {}
           decoder = null;
           onNeedKeyframe && onNeedKeyframe();
           onError && onError(err);
         },
       });
+      decoder = instance;
+    }
+
+    function recoverFromBacklog() {
+      const stale = decoder;
+      decoder = null;
+      configured = false;
+      waitingForKeyframe = true;
+      try { stale && stale.state !== 'closed' && stale.close(); } catch {}
+      onNeedKeyframe && onNeedKeyframe();
     }
 
     async function configureFrom(keyframeBytes) {
       const codec = codecStringFromKeyframe(keyframeBytes);
       if (!codec) return false; // wait for a buffer that actually contains the SPS
+      const target = decoder;
+      if (!target) return false;
       const config = { codec, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' };
       try {
         const support = await VideoDecoder.isConfigSupported(config);
+        if (decoder !== target || target.state === 'closed') return false;
         if (!support.supported) {
           // Retry without the hardware hint before giving up (some builds only do software).
           const soft = { codec, optimizeForLatency: true };
           const s2 = await VideoDecoder.isConfigSupported(soft);
+          if (decoder !== target || target.state === 'closed') return false;
           if (!s2.supported) { onError && onError(new Error('H.264 config unsupported: ' + codec)); return false; }
-          decoder.configure(soft);
+          target.configure(soft);
         } else {
-          decoder.configure(config);
+          target.configure(config);
         }
+        if (decoder !== target || target.state === 'closed') return false;
         configured = true;
         return true;
       } catch (err) {
-        onError && onError(err);
+        if (decoder === target) onError && onError(err);
         return false;
       }
     }
 
     return {
       get supported() { return supported; },
+      get pending() { return decoder ? decoder.decodeQueueSize : 0; },
+      takeStats() {
+        const stats = {
+          paintMs: lastPaintMs,
+          paintPeakMs: peakPaintMs,
+          paintGapMs: lastPaintGapMs,
+          paintGapPeakMs: peakPaintGapMs,
+        };
+        peakPaintMs = 0;
+        peakPaintGapMs = 0;
+        return stats;
+      },
 
       // Feed one access unit. `isKeyframe` comes from the server (the encoder knows
       // which frames are IDRs) so we don't have to scan every delta for slice types.
@@ -144,6 +188,14 @@
           waitingForKeyframe = false;
         }
         if (!configured) return;
+
+        // Playing stale frames is worse than a short visual snap in a remote desktop.
+        // If decode falls more than a few frames behind, discard the dependency chain
+        // and ask the host for a fresh IDR instead of spending seconds catching up.
+        if (decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
+          recoverFromBacklog();
+          return;
+        }
 
         try {
           decoder.decode(new EncodedVideoChunk({

@@ -28,7 +28,7 @@ public sealed class AppConfig
     /// <summary>Argon2id hash string, or null when first-run setup is required.</summary>
     public string? PasswordHash { get; set; }
 
-    public int SessionTimeoutMinutes { get; set; } = 15;
+    public int SessionTimeoutMinutes { get; set; } = 120;
     public bool RemoteAccessEnabled { get; set; } = false;
     public bool ClipboardSyncEnabled { get; set; } = false;
     public RemoteAccessMode AccessMode { get; set; } = RemoteAccessMode.LanOnly;
@@ -40,7 +40,7 @@ public sealed class AppConfig
     /// When true (default), streaming uses GPU capture (DXGI Desktop Duplication) + hardware
     /// H.264 instead of the JPEG-tile path; with VideoLowLatency it's the per-frame WebCodecs
     /// path (single-digit-ms). Toggle it off from the tray to force JPEG tiles. If no hardware
-    /// encoder is available the server falls back to JPEG automatically. See PROTOTYPE.md.
+    /// encoder is available the server falls back to JPEG automatically.
     /// </summary>
     public bool UseHardwareVideo { get; set; } = true;
 
@@ -57,7 +57,9 @@ public sealed class AppConfig
     public bool StartWithWindows { get; set; } = false;
     public bool StartMinimized { get; set; } = true;
     public bool ShowTaskbarButton { get; set; } = false;
+    public bool ShowViewerOverlay { get; set; } = true;
     public bool TryAutomaticPortForwarding { get; set; } = true;
+    public string? HostDisplayName { get; set; }
     public string? LastRemoteUrl { get; set; }
     public string? LastRouterUrl { get; set; }
 
@@ -70,8 +72,10 @@ public sealed class AppConfig
         if (!File.Exists(AppPaths.ConfigFile)) return new AppConfig();
         try
         {
-            return JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(AppPaths.ConfigFile))
+            var config = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(AppPaths.ConfigFile))
                    ?? new AppConfig();
+            if (config.SessionTimeoutMinutes < 60) config.SessionTimeoutMinutes = 120;
+            return config;
         }
         catch
         {

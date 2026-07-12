@@ -1,4 +1,5 @@
 using Core.Config;
+using Core.Branding;
 using Core.Hosting;
 using Core.RemoteAccess;
 using Core.Tray;
@@ -20,6 +21,11 @@ internal static class Program
         // require an explicit tray action before accepting streaming requests.
         config.RemoteAccessEnabled = false;
         config.Save();
+        if (config.StartWithWindows)
+        {
+            try { StartupRegistrationService.SetEnabled(true); }
+            catch { /* tray settings can repair the startup entry later */ }
+        }
 
         var network = new NetworkInfoService();
         var host = new RemoteDesktopHost(config, network);
@@ -40,8 +46,8 @@ internal static class Program
         catch (Exception ex)
         {
             WinForms.MessageBox.Show(
-                $"RemoteDesktopLAN could not start.\n\n{ex.Message}",
-                "RemoteDesktopLAN",
+                $"{ProductInfo.Name} could not start.\n\n{ex.Message}",
+                ProductInfo.Name,
                 WinForms.MessageBoxButtons.OK,
                 WinForms.MessageBoxIcon.Error);
         }
